@@ -6,11 +6,10 @@ import { runAgent } from './agent.js';
 import { GengarOverlay, printHex } from './gengar.js';
 import { SteerInput } from './steer.js';
 import { sleep } from './keys.js';
-import { resolveRoomId } from './memory/room.js';
+import { resolveRoomId, gexHome } from './memory/room.js';
 import { Ledger } from './memory/ledger.js';
 import { buildSummonPack } from './memory/retrieve.js';
 import { distillSession } from './memory/distill.js';
-import { gexHome } from './memory/room.js';
 
 export async function main(argv) {
   const opts = parseArgs(argv);
@@ -45,7 +44,7 @@ export async function main(argv) {
     await session.key('enter');
     await session.waitFor({ quietMs: 400, timeoutMs: 5_000 });
   }
-  gengar.setState('thinking', 'plan');
+  gengar.setState('thinking', 'survey+efficiency');
 
   const steerQueue = [];
   let aborted = false;
@@ -75,9 +74,9 @@ export async function main(argv) {
   });
   steer.start();
 
-  const onStatus = (s) => {
-    // status goes to gengar bar only — no extra scroll
-    gengar.setState(gengar.state === 'watching' ? 'watching' : 'thinking', s);
+  const onProgressHex = (note) => {
+    printHex(note, gengar);
+    process.stderr.write(`\x1b[38;2;95;104;115m(progress — still working)\x1b[0m\n`);
   };
 
   let result = { ok: false, message: 'aborted', sessionEvents: [] };
@@ -88,14 +87,15 @@ export async function main(argv) {
       apiKey,
       maxSteps: opts.maxSteps,
       steerQueue,
-      onStatus,
+      onStatus: (s) =>
+        gengar.setState(gengar.state === 'watching' ? 'watching' : 'thinking', s),
       gengar,
       ledger,
       memoryPack,
+      onProgressHex,
     });
 
-    while (true) {
-      if (aborted) break;
+    while (!aborted) {
       const done = await Promise.race([
         agentPromise.then((r) => ({ type: 'done', r })),
         sleep(100).then(() => ({ type: 'tick' })),
@@ -111,14 +111,13 @@ export async function main(argv) {
       } catch {
         /* ignore */
       }
-      result = { ok: false, message: 'Aborted by user.', sessionEvents: result.sessionEvents || [] };
+      result = { ok: false, message: 'Aborted by user.', sessionEvents: [] };
       ledger.append('session_abort', { actor: 'user' });
     }
   } finally {
     steer.stop();
   }
 
-  // Flush driven shell
   try {
     if (!session.exited) {
       await session.submit('history save 2>/dev/null');
@@ -131,13 +130,14 @@ export async function main(argv) {
   }
   await session.dispose();
 
-  // Distill + persist
   const events = ledger.tail(200).filter((e) => e.session === ledger.sessionId);
   const summary = distillSession({
     task,
     events,
     finalMessage: result.message,
   });
+  if (result.efficiency) summary.efficiency = result.efficiency;
+  if (result.commands) summary.commands = result.commands;
   ledger.writeSummary(summary);
   ledger.append('session_end', {
     actor: 'gex',
@@ -161,6 +161,7 @@ export async function main(argv) {
           ok: !!result.ok,
           message: result.message || '',
           cwd: process.cwd(),
+          efficiency: result.efficiency || null,
           summary,
         },
         null,
@@ -175,51 +176,46 @@ export async function main(argv) {
 }
 
 function parseArgs(argv) {
-  const opts = { _: [], help: false, maxSteps: 28 };
+  const opts = { _: [], help: false, maxSteps: 32 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--') {
-      // rest is literal task tokens
       opts._.push(...argv.slice(i + 1));
       break;
     }
     if (a === '-h' || a === '--help') opts.help = true;
-    else if (a === '--max-steps') opts.maxSteps = Number(argv[++i]) || 28;
-    else if (a === 'recall' || a === 'log') {
-      opts.help = false;
-      opts._.push(a);
-    } else if (a.startsWith('-')) {
+    else if (a === '--max-steps') opts.maxSteps = Number(argv[++i]) || 32;
+    else if (a === 'recall' || a === 'log') opts._.push(a);
+    else if (a.startsWith('-')) {
       process.stderr.write(`gex: unknown flag ${a}\n`);
       process.exit(2);
     } else opts._.push(a);
   }
-  // gex recall <q>
   if (opts._[0] === 'recall') {
     const roomId = resolveRoomId(process.env);
     const ledger = new Ledger(roomId);
-    const q = opts._.slice(1).join(' ') || '';
-    const pack = buildSummonPack(ledger, q || 'recent');
-    console.log(pack);
+    console.log(buildSummonPack(ledger, opts._.slice(1).join(' ') || 'recent'));
     process.exit(0);
   }
   return opts;
 }
 
 function printHelp() {
-  console.log(`
-gex — Ghostty terminal autopilot (Gengar)
+  console.log(
+    `
+gex — terminal autopilot (best tool for the job)
 
-  Native TTY. Bottom status sprite (no scroll poison).
-  Drives live fish. Enter steers. Remembers the room.
+  Surveys PATH/project, forces an efficiency plan, can install better tools
+  (e.g. tree for directory maps), run parallel jobs, progressive HEX,
+  remembers winning recipes.
 
 Usage:
-  gex <task>
-  gex show me system stats
-  gex please update homebrew apps
-  gex recall brew          # memory pack dump
+  gex <any task>
+  gex print this directory as a tree
+  gex recall <query>
 
-Steer: type+enter · stop/abort · ctrl-c shell · ctrl-c×2 abort
-Env: DEEPSEEK_API_KEY
-Memory: ~/.cache/gex/rooms/<room>/
-`.trim());
+Steer: type+enter · stop · ctrl-c · ctrl-c×2 abort
+toolkit: ~/.cache/gex/toolkit/
+`.trim(),
+  );
 }
