@@ -1,0 +1,23 @@
+{
+  "name": "gshell",
+  "version": "0.1.0",
+  "description": "gex — Ghostty terminal autopilot. Gengar drives your shell.",
+  "type": "module",
+  "bin": {
+    "gex": "./bin/gex.js"
+  },
+  "scripts": {
+    "gex": "node bin/gex.js",
+    "postinstall": "node scripts/install-fish.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0"
+  },
+  "license": "MIT",
+  "allowScripts": {
+    "node-pty@1.1.0": true
+  }
+}

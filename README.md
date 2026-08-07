@@ -1,95 +1,60 @@
-<div align="center">
+# gShell / gex
 
-<img src="./images/11.png" width="5%"/>
+**Terminal autopilot for Ghostty.** Gengar drives your live fish shell.
 
-<h1 align="center">gshell — GShadow Terminal</h1>
+No special app UI. Native TTY only. A dancing fire-Gengar on the left is the sole chrome.
 
-AI-native terminal assistant. Watchful. Direct. Yours.
+## gex
 
-`gsh` is the command. The shell answers.
+```fish
+gex show me system stats
+gex scaffold a nextjs app called dashboard
+gex find a file with fzf and open it
+```
 
-[Download](https://github.com/GShadow-Dev/gshell/releases) · [Docs](https://github.com/GShadow-Dev/gshell/wiki)
+### What you see
+- Your real terminal output (PTY) — full fidelity, fzf/wizards/tab work
+- Fire Gengar sprite on the left, hands dancing while he works
+- Bottom `steer>` — type and hit Enter to redirect him mid-flight
 
-[![macOS](https://img.shields.io/badge/-macOS-black?logo=apple)](https://github.com/GShadow-Dev/gshell/releases)
-[![Windows](https://img.shields.io/badge/-Windows-blue?logo=windows)](https://github.com/GShadow-Dev/gshell/releases)
-[![Linux](https://img.shields.io/badge/-Linux-yellow?logo=linux)](https://github.com/GShadow-Dev/gshell/releases)
+### What he can do
+- Type commands (land in the driven session’s history)
+- Tab, arrows, ctrl-c, ctrl-r, menus, interactive installers
+- Pick settings himself (Next.js flags, package managers) — no handoff
 
-</div>
-
----
-
-## What gshell is
-
-gshell extends the GShadow digital shadow into your terminal. It watches your workflow, answers with evidence, and acts when you tell it to. Not a chatbot. Not a wrapper around someone else's API key form. A terminal-native agent that belongs to you.
-
-Lead with the finding. Check the bodies. Move.
+### Steer
+| Input | Effect |
+|---|---|
+| type + Enter | STEER message to Gengar |
+| `stop` / `abort` | End autopilot |
+| Ctrl-C | ctrl-c into driven shell |
+| Ctrl-C twice | Abort gex |
 
 ## Install
 
-Download the latest from [releases](https://github.com/GShadow-Dev/gshell/releases).
-
-```
-gsh
-```
-
-That's it. The terminal assistant wakes.
-
-## Capabilities
-
-- **Shell-native.** gsh integrates with your terminal, not a browser tab. Pipe output in. Pipe decisions out.
-- **Multi-model.** Route to the model that fits the task. No lock-in.
-- **Context-aware.** gsh sees your working directory, git state, and shell history. It knows where you are.
-- **Plugin system.** Extend with custom providers, tools, and workflows. Drop a plugin file. It loads.
-- **Cross-platform.** macOS, Windows, Linux. One binary. Same behavior.
-- **Local-first.** Your data stays on your machine unless you send it somewhere. gsh watches. It doesn't leak.
-
-## Plugins
-
-gshell loads plugins from `~/.gshell/plugins/`. A plugin is a single JS file that defines a provider:
-
-```js
-module.exports = {
-  options: {
-    myProvider: {
-      displayName: 'My Provider',
-      name: 'myProvider',
-      url: 'https://api.example.com/chat',
-      method: 'POST',
-      type: 'plugin',
-      headers: { 'Content-Type': 'application/json' },
-      body: (messages) => JSON.stringify({ messages, stream: true }),
-      fn: async function(controller, event, messages, message) {
-        // Handle the stream
-      }
-    }
-  }
-}
+```fish
+cd ~/Documents/gshell   # or clone GShadow-Dev/gshell
+npm install             # builds node-pty + installs fish wrapper
 ```
 
-See the [plugin development guide](https://github.com/GShadow-Dev/gshell/wiki/Plugins) for the full API.
+Requires: Ghostty, fish, Node 20+, `chafa`, `DEEPSEEK_API_KEY`.
 
-## From the brand
-
-gshell operates under the GShadow worldview:
-
-- **Watchful, not paranoid.** It observes your terminal. It doesn't surveil.
-- **Direct, not careless.** Short answers. Concrete next actions.
-- **Independent, not oppositional.** It follows evidence, not popularity.
-- **Strange with purpose, never random.** Violet trace in the void. One edge at a time.
-
-> Green dashboards lie. I check the bodies.
-
-## Build from source
-
-```bash
-git clone https://github.com/GShadow-Dev/gshell.git
-cd gshell
-npm install
-npm run build
+```fish
+# key already in conf.d on this machine:
+# ~/.config/fish/conf.d/20-deepseek.fish
 ```
 
-Requires Node.js 18+ and Electron 23+.
+## Layout
 
-## License
+```
+bin/gex.js           CLI
+src/cli.js           autopilot wiring
+src/pty_session.js   live PTY mirror
+src/agent.js         model loop (submit/type/key/wait/done)
+src/gengar.js        dancing sprite (kitty/chafa)
+src/steer.js         keyboard → steer queue
+assets/fire-gengar.png
+```
 
-MIT. GShadow brand assets and the NIGHTGRIN persona are property of Fincher Labs.
+## Brand
+Ember Glass · GShadow · Fincher Labs
