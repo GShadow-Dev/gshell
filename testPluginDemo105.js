@@ -27,7 +27,7 @@ const options = {
                 options: {
                     parentMessageId: parentMessageId
                 },
-                systemMessage: 'You are ChatGPT, a large language model trained by OpenAI. Answer as concisely as possible.\nKnowledge cutoff: 2021-09-01\nCurrent date: 2023-03-29',
+                systemMessage: 'You are an AI assistant. Answer concisely and accurately.\nCurrent date: 2023-03-29',
                 temperature: 0.8,
                 top_p: 1,
             })

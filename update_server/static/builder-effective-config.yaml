@@ -1,7 +1,9 @@
 directories:
   output: dist
   buildResources: build
-appId: com.akl.chatgpt
+appId: dev.gshadow.gshell
+productName: gshell
+executableName: gsh
 mac:
   icon: icon.png
   target:
@@ -9,14 +11,14 @@ mac:
     - zip
   publish:
     - provider: generic
-      url: https://github.com/akl7777777/free-chatgpt-client-pub/releases/latest
+      url: https://github.com/GShadow-Dev/gshell/releases/latest
 win:
   icon: icon.png
   target:
     - nsis
   publish:
     - provider: generic
-      url: https://github.com/akl7777777/free-chatgpt-client-pub/releases/latest
+      url: https://github.com/GShadow-Dev/gshell/releases/latest
 nsis:
   oneClick: false
   perMachine: true
@@ -30,6 +32,6 @@ linux:
     - application/x-myapp
   publish:
     - provider: generic
-      url: https://github.com/akl7777777/free-chatgpt-client-pub/releases/latest
+      url: https://github.com/GShadow-Dev/gshell/releases/latest
 files: []
 electronVersion: 23.1.3
