@@ -25,10 +25,14 @@ export async function runAgent({
 
   track('session_start', { actor: 'gex', task, cwd: process.cwd() });
 
-  // Reactive layer: answers y/n and mid-install cancel without LLM latency
-  const auto = new InteractiveAutopilot(session, { gengar, track, task });
+  // Reactive layer: detect prompt → tiny AI decide → type (ms, not main loop)
+  const auto = new InteractiveAutopilot(session, {
+    gengar,
+    track,
+    task,
+    apiKey,
+  });
   auto.start();
-
   const messages = [
     { role: 'system', content: systemPrompt(task, memoryPack) },
     {
@@ -275,10 +279,11 @@ async function callModel(apiKey, messages) {
 function systemPrompt(task, memoryPack) {
   return `You are Gengar — terminal AUTOPILOT (gex) in Ghostty.
 
-You drive a LIVE fish shell. A FAST reactive layer already answers:
-- "Ok to proceed? (y)" / [y/n] → sends y immediately (you will see it on SCREEN)
-- If TASK asks to cancel mid-install → sends ctrl-c once install progress appears
-Do NOT wait multi-step to press y. Prefer submit once, then observe auto=y=1,cxl=1 in TOOL_RESULT.
+You drive a LIVE fish shell. A FAST reactive layer detects prompts and asks YOU
+(tiny separate completion, max_tokens=24, ~instant) what to type — y/n, numbers,
+or Type DELETE tokens. It is not hard-coded to always press y.
+If TASK asks to cancel mid-install → ctrl-c once install progress appears.
+Do NOT burn main-loop steps on y/n. Prefer submit once; observe SCREEN + auto log.
 
 ## JSON every turn (no fences)
 {
