@@ -51,6 +51,8 @@ export async function runAgent({
   let efficiency = playbook?.efficiency || null;
   let efficiencyLocked = false;
   const ranCommands = [];
+  /** @type {Map<string, {n:number, err:string}>} */
+  const failMap = new Map();
   const tSession = Date.now();
   const progressNotes = [];
 
@@ -104,6 +106,7 @@ export async function runAgent({
         cmdPeek,
         ranCommands,
         message: action.message || action.reason || '',
+        failMap,
       });
       if (reject) {
         messages.push({ role: 'user', content: reject });
@@ -162,6 +165,7 @@ export async function runAgent({
           track,
           ledger,
           ranCommands,
+          failMap,
           toolkit,
           survey,
           messages,
@@ -326,6 +330,7 @@ export async function runAgent({
           track,
           ledger,
           ranCommands,
+          failMap,
           toolkit,
           survey,
           messages,
@@ -362,16 +367,12 @@ export async function runAgent({
   }
 }
 
-function gate({ kind, efficiencyLocked, hasEff, cmdPeek, ranCommands, message }) {
+function gate({ kind, efficiencyLocked, hasEff, cmdPeek, ranCommands, message, failMap }) {
   if (!kind || kind === 'plan') {
     return efficiencyLocked ? REJECT.planOnly : REJECT.needEfficiency;
   }
 
-  if (
-    !efficiencyLocked &&
-    !hasEff &&
-    !['memory_search'].includes(kind)
-  ) {
+  if (!efficiencyLocked && !hasEff && !['memory_search'].includes(kind)) {
     return REJECT.needEfficiency;
   }
 
@@ -379,14 +380,20 @@ function gate({ kind, efficiencyLocked, hasEff, cmdPeek, ranCommands, message })
     const worked = ranCommands.some((c) => String(c || '').trim());
     const msg = String(message || '').trim();
     const hollow = !msg || /^done\.?$/i.test(msg) || msg.length < 24;
-    // pure chat exception: greetings only
     const chatty = /^(hi|hello|hey)\b/i.test(msg) && msg.length < 80;
     if (!worked && !chatty) return REJECT.doneNoWork;
     if (worked && hollow) return REJECT.doneHollow;
     if (!worked && hollow) return REJECT.doneNoWork;
   }
 
-  if (kind === 'submit' && !String(cmdPeek || '').trim()) return REJECT.emptySubmit;
+  if (kind === 'submit' || kind === 'install') {
+    const line = String(cmdPeek || '').trim();
+    if (!line) return REJECT.emptySubmit;
+    const fails = failMap?.get(line);
+    if (fails && fails.n >= 2) {
+      return REJECT.repeatFail(line, fails.n, fails.err);
+    }
+  }
 
   return null;
 }
@@ -400,6 +407,7 @@ async function execLine({
   track,
   ledger,
   ranCommands,
+  failMap,
   toolkit,
   survey,
   messages,
@@ -422,6 +430,24 @@ async function execLine({
     timeoutMs,
   });
   const out = session.screenText(16000);
+  const errTail = out
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => /error|failed|not found|syntax|denied|quitting|usage:/i.test(l))
+    .slice(-4)
+    .join(' | ');
+
+  // failure loop accounting: exit!=0 or obvious error lines
+  const failed =
+    (result.exitHint != null && result.exitHint !== 0) ||
+    /syntax error|not found|failed|quitting!/i.test(out.slice(-1500));
+  if (failed) {
+    const prev = failMap?.get(line) || { n: 0, err: '' };
+    failMap?.set(line, { n: prev.n + 1, err: errTail || prev.err || 'nonzero exit' });
+  } else {
+    failMap?.delete(line);
+  }
+
   ledger?.putBlob(out, tags.includes('install') ? 'install' : 'cmd');
   track('cmd_end', {
     actor: 'gex',
@@ -444,9 +470,14 @@ async function execLine({
       survey.path_bins = Array.from(new Set([...survey.path_bins, bin])).sort();
     }
   }
+
+  const failNote = failed
+    ? `\nFAIL count for this exact command: ${failMap?.get(line)?.n || 1}. Do NOT retry the same command. Change approach.`
+    : '';
+
   messages.push({
     role: 'user',
-    content: `TOOL_RESULT ${tags.includes('install') ? 'install' : 'submit'} reason=${result.reason} ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}\n\n${REJECT.afterTool}`,
+    content: `TOOL_RESULT ${tags.includes('install') ? 'install' : 'submit'} reason=${result.reason} ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}${failNote}\n\n${REJECT.afterTool}`,
   });
 }
 

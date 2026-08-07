@@ -34,16 +34,22 @@ done: {"action":"done","message":"<substantive summary>"}
 
 HARD NO
 - done with "Done." / empty / <24 chars
-- done with zero commands run (unless task is pure chat/greeting)
+- done with zero commands run (unless pure chat)
 - empty submit.command
+- retrying the SAME failing command (change approach after 1 fail; host blocks after 2)
 - claiming success without TOOL_RESULT
-- inventing tool output
+
+ON ERROR
+Read the error. Change tool, flags, quoting, or strategy. Never spam the identical command.
+
+STEER
+User can type at any time (steer› line). Messages like "stuck", "try X", "stop" arrive as STEER — obey immediately.
 
 DONE MESSAGE
-Lead with findings. Facts from TOOL_RESULT (numbers, names, paths, errors). Short. No filler.
+Lead with findings. Facts from TOOL_RESULT. Short. No filler.
 
 SCOPE
-Any task. Derive plan from THIS task + THIS survey every time.`;
+Any task. Plan from THIS task + THIS survey every time.`;
 
 export function userBrief({
   task,
@@ -92,10 +98,12 @@ export const REJECT = {
   doneHollow:
     'NO done: message empty/placeholder. Summarize commands + concrete results (numbers, names, paths, errors). Never only "Done."',
   afterTool:
-    'Next: more install|submit|parallel if needed, else done with a concrete summary of TOOL_RESULT (not "Done.").',
+    'Next: more install|submit|parallel if needed, else done with a concrete summary of TOOL_RESULT (not "Done."). If the last command failed, do NOT repeat it — change approach.',
   afterCancel:
     'ctrl-c was sent. Cleanup if needed, then done with a real summary.',
   afterProgress: 'Progress shown. Continue until task complete.',
+  repeatFail: (cmd, n, err) =>
+    `NO: command failed ${n}×. Do not run it again.\nCMD: ${clip(cmd, 160)}\nERR: ${clip(err || 'error', 200)}\nPick a different command/tool/flags.`,
   unknown: (k) =>
     `NO: unknown action "${k}". Use install|submit|parallel|progress_hex|type|key|wait|memory_search|done.`,
 };
