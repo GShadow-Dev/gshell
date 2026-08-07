@@ -51,7 +51,7 @@ export async function runAgent({
   let efficiency = playbook?.efficiency || null;
   let efficiencyLocked = false;
   const ranCommands = [];
-  /** @type {Map<string, {n:number, err:string}>} */
+  /** @type {Map<string, {n:number, err:string, bin:string}>} */
   const failMap = new Map();
   const tSession = Date.now();
   const progressNotes = [];
@@ -275,7 +275,10 @@ export async function runAgent({
         gengar?.setState('watching', `swarm 0/${jobs.length}`);
         track('parallel_start', {
           actor: 'gex',
-          text: jobs.map((j) => j.cmd).join(' || ').slice(0, 1500),
+          text: jobs
+            .map((j) => j.cmd)
+            .join(' || ')
+            .slice(0, 1500),
         });
 
         const results = await runParallel(jobs, {
@@ -302,15 +305,12 @@ export async function runAgent({
             duration_ms: r.ms,
             tags: ['parallel'],
           });
-          const b = guessBin(r.cmd);
-          if (b) toolkit.noteTool(b, { used: true });
         }
 
+        const board = formatParallelBoard(results);
         messages.push({
           role: 'user',
-          content: `TOOL_RESULT parallel conc=${conc}\n${formatParallelBoard(
-            results,
-          )}\n\n${REJECT.afterTool}`,
+          content: `TOOL_RESULT parallel conc=${conc}\n${board}\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
         });
         continue;
       }
@@ -343,19 +343,15 @@ export async function runAgent({
         continue;
       }
 
-      if (kind === 'done' || kind === 'reply') {
-        // handled above
-        continue;
-      }
-
-      messages.push({ role: 'user', content: REJECT.unknown(kind) });
+      messages.push({
+        role: 'user',
+        content: REJECT.unknown(kind),
+      });
     }
 
     return {
       ok: false,
-      message: ranCommands.length
-        ? `Step limit. Ran: ${ranCommands.join(' · ')}`
-        : 'Step limit; no commands run.',
+      message: 'Hit max steps without finishing.',
       steps: maxSteps,
       sessionEvents,
       autoLog: auto.log,
@@ -367,7 +363,15 @@ export async function runAgent({
   }
 }
 
-function gate({ kind, efficiencyLocked, hasEff, cmdPeek, ranCommands, message, failMap }) {
+function gate({
+  kind,
+  efficiencyLocked,
+  hasEff,
+  cmdPeek,
+  ranCommands,
+  message,
+  failMap,
+}) {
   if (!kind || kind === 'plan') {
     return efficiencyLocked ? REJECT.planOnly : REJECT.needEfficiency;
   }
@@ -389,9 +393,29 @@ function gate({ kind, efficiencyLocked, hasEff, cmdPeek, ranCommands, message, f
   if (kind === 'submit' || kind === 'install') {
     const line = String(cmdPeek || '').trim();
     if (!line) return REJECT.emptySubmit;
-    const fails = failMap?.get(line);
+    const sig = cmdSignature(line);
+    const fails = failMap?.get(sig);
     if (fails && fails.n >= 2) {
       return REJECT.repeatFail(line, fails.n, fails.err);
+    }
+    // same bin failed across variants
+    const bin = guessBin(line);
+    if (bin && failMap) {
+      let binFails = 0;
+      let lastErr = '';
+      for (const v of failMap.values()) {
+        if (v.bin === bin) {
+          binFails += v.n;
+          lastErr = v.err || lastErr;
+        }
+      }
+      if (binFails >= 3) {
+        return REJECT.repeatFail(
+          `${bin} … (${binFails} failures)`,
+          binFails,
+          lastErr || 'repeated tool failure — change approach',
+        );
+      }
     }
   }
 
@@ -430,35 +454,39 @@ async function execLine({
     timeoutMs,
   });
   const out = session.screenText(16000);
-  const errTail = out
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => /error|failed|not found|syntax|denied|quitting|usage:/i.test(l))
-    .slice(-4)
-    .join(' | ');
+  const exitCode = inferExit(out, result.exitHint);
+  const errTail = extractErrors(out);
+  const sig = cmdSignature(line);
+  const bin = normBin(binHint || guessBin(line));
 
-  // failure loop accounting: exit!=0 or obvious error lines
   const failed =
-    (result.exitHint != null && result.exitHint !== 0) ||
-    /syntax error|not found|failed|quitting!/i.test(out.slice(-1500));
+    (exitCode != null && exitCode !== 0) ||
+    /syntax error|not found|execution error|failed|quitting!|usage:/i.test(
+      out.slice(-2000),
+    );
+
   if (failed) {
-    const prev = failMap?.get(line) || { n: 0, err: '' };
-    failMap?.set(line, { n: prev.n + 1, err: errTail || prev.err || 'nonzero exit' });
+    const prev = failMap?.get(sig) || { n: 0, err: '', bin };
+    failMap?.set(sig, {
+      n: prev.n + 1,
+      err: errTail || prev.err || `exit ${exitCode ?? '?'}`,
+      bin: bin || prev.bin || '',
+    });
   } else {
-    failMap?.delete(line);
+    failMap?.delete(sig);
   }
 
   ledger?.putBlob(out, tags.includes('install') ? 'install' : 'cmd');
   track('cmd_end', {
     actor: 'gex',
     cmd: line,
-    exit: result.exitHint,
+    exit: exitCode,
     duration_ms: Date.now() - t0,
     tags,
     auto: fmtAuto(auto),
   });
   ranCommands.push(line);
-  const bin = normBin(binHint || guessBin(line));
+
   if (bin) {
     toolkit.noteTool(bin, {
       installed: tags.includes('install') || undefined,
@@ -472,12 +500,12 @@ async function execLine({
   }
 
   const failNote = failed
-    ? `\nFAIL count for this exact command: ${failMap?.get(line)?.n || 1}. Do NOT retry the same command. Change approach.`
+    ? `\nFAIL #${failMap?.get(sig)?.n || 1} for this command shape (bin=${bin || '?'}). Do NOT retry the same approach. Change tool, flags, quoting, or use a heredoc script.`
     : '';
 
   messages.push({
     role: 'user',
-    content: `TOOL_RESULT ${tags.includes('install') ? 'install' : 'submit'} reason=${result.reason} ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}${failNote}\n\n${REJECT.afterTool}`,
+    content: `TOOL_RESULT ${tags.includes('install') ? 'install' : 'submit'} reason=${result.reason} exit=${exitCode ?? 'null'} ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}${failNote}\n\n${REJECT.afterTool}`,
   });
 }
 
@@ -518,7 +546,7 @@ async function watchUntilPrompt(
     if (promptAfterMark(session, mark) && Date.now() - lastGrowth >= 450) {
       return {
         reason: auto.cancelled ? 'cancelled' : 'prompt',
-        exitHint: auto.cancelled ? 130 : 0,
+        exitHint: auto.cancelled ? 130 : null,
       };
     }
 
@@ -603,25 +631,72 @@ function guessBin(cmd) {
   return i >= 0 ? tok.slice(i + 1) : tok;
 }
 
+/** Collapse string literals so tiny quote edits still match. */
+function cmdSignature(line) {
+  return String(line || '')
+    .replace(/'(?:\\'|[^'])*'/g, "'…'")
+    .replace(/"(?:\\"|[^"])*"/g, '"…"')
+    .replace(/\$'[\s\S]*?'/g, "$'…'")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240);
+}
+
+function extractErrors(out) {
+  return String(out || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) =>
+      /error|failed|not found|syntax|denied|quitting|usage:|execution error/i.test(
+        l,
+      ),
+    )
+    .slice(-5)
+    .join(' | ')
+    .slice(0, 400);
+}
+
+/** Prefer real shell exit from prompt markers (fish ✘ N). */
+function inferExit(out, hint) {
+  const text = String(out || '');
+  const m1 = text.match(/✘\s*(\d+)/);
+  if (m1) return Number(m1[1]);
+  const m2 = text.match(/\bexit(?:ed| status| code)?[:\s]+(\d+)\b/i);
+  if (m2) return Number(m2[1]);
+  if (
+    /syntax error|execution error|not found|command not found/i.test(
+      text.slice(-2500),
+    )
+  ) {
+    return hint != null && hint !== 0 ? hint : 1;
+  }
+  if (hint != null) return hint;
+  return 0;
+}
+
 function normBin(s) {
   return String(s || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9._+-]/g, '')
-    .slice(0, 48);
+    .trim()
+    .replace(/.*\//, '');
 }
 
 function fmtAuto(auto) {
+  if (!auto) return 'n/a';
   return `y=${auto.answeredConfirm ? 1 : 0},cxl=${auto.cancelled ? 1 : 0}`;
 }
 
 function drainSteers(q, messages, session, track, gengar) {
   if (!q?.length) return;
-  const lines = q.splice(0, q.length);
+  const lines = q
+    .splice(0, q.length)
+    .map((s) => String(s || '').trim())
+    .filter(Boolean);
+  if (!lines.length) return;
   gengar?.setState('awake', 'steer');
-  for (const text of lines) track('steer', { actor: 'user', text });
+  for (const line of lines) track('steer', { actor: 'user', text: line });
   messages.push({
     role: 'user',
-    content: `STEER\n${lines.join('\n')}\n--- SCREEN ---\n${session.screenText()}`,
+    content: `STEER (user override — obey immediately)\n${lines.join('\n')}\nIf they say stuck/stop/wrong: change approach NOW. Do not repeat the last failing command.\n--- SCREEN ---\n${session.screenText(8000)}`,
   });
 }
 

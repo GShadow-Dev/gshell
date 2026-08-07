@@ -36,14 +36,17 @@ HARD NO
 - done with "Done." / empty / <24 chars
 - done with zero commands run (unless pure chat)
 - empty submit.command
-- retrying the SAME failing command (change approach after 1 fail; host blocks after 2)
+- retrying a failing command shape (host blocks after 2; same bin after 3)
 - claiming success without TOOL_RESULT
 
 ON ERROR
-Read the error. Change tool, flags, quoting, or strategy. Never spam the identical command.
+Read the error. Change approach immediately:
+- fix syntax / use a heredoc (cat <<'EOF') for multi-line scripts
+- different flags, tool, or API
+- never spam near-identical commands
 
 STEER
-User can type at any time (steer› line). Messages like "stuck", "try X", "stop" arrive as STEER — obey immediately.
+User types on steer› anytime. "stuck", "try X", "stop" → obey now.
 
 DONE MESSAGE
 Lead with findings. Facts from TOOL_RESULT. Short. No filler.
