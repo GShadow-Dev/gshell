@@ -1,11 +1,56 @@
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import process from 'node:process';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import pty from 'node-pty';
 import { keyToBytes, sleep } from './keys.js';
 
+const require = createRequire(import.meta.url);
+
+/** node-pty's spawn-helper must be +x or posix_spawnp fails on macOS. */
+function ensureSpawnHelperExecutable() {
+  try {
+    const ptyPkg = path.dirname(require.resolve('node-pty/package.json'));
+    const pre = path.join(ptyPkg, 'prebuilds');
+    const walk = (dir) => {
+      if (!fs.existsSync(dir)) return;
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        if (fs.statSync(p).isDirectory()) walk(p);
+        else if (name === 'spawn-helper') {
+          fs.chmodSync(p, 0o755);
+        }
+      }
+    };
+    walk(pre);
+  } catch {
+    /* ignore */
+  }
+}
+
+function resolveShell() {
+  const candidates = [
+    process.env.SHELL,
+    '/opt/homebrew/bin/fish',
+    '/usr/local/bin/fish',
+    '/bin/zsh',
+    '/bin/bash',
+  ].filter(Boolean);
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
+    } catch {
+      /* ignore */
+    }
+  }
+  return '/bin/bash';
+}
+
 export class PtySession {
   constructor(opts = {}) {
-    this.shell = opts.shell || defaultShell();
+    this.shell = opts.shell || resolveShell();
     this.cwd = opts.cwd || process.cwd();
     this.cols = process.stdout.columns || 120;
     this.rows = process.stdout.rows || 40;
@@ -21,18 +66,40 @@ export class PtySession {
       throw new Error('gex needs a real Ghostty TTY');
     }
 
-    this.term = pty.spawn(this.shell, ['-l', '-i'], {
-      name: process.env.TERM || 'xterm-ghostty',
-      cols: this.cols,
-      rows: this.rows,
-      cwd: this.cwd,
-      env: {
-        ...process.env,
-        GEX_AUTOPILOT: '1',
-        // Keep Ghostty identity for greeting/chafa paths inside the child
-        TERM_PROGRAM: process.env.TERM_PROGRAM || 'ghostty',
-      },
-    });
+    ensureSpawnHelperExecutable();
+
+    if (!fs.existsSync(this.shell)) {
+      throw new Error(`shell not found: ${this.shell}`);
+    }
+
+    // Clean env — strip empty values that can confuse spawn
+    const env = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined && v !== null) env[k] = String(v);
+    }
+    env.GEX_AUTOPILOT = '1';
+    env.TERM = env.TERM || 'xterm-256color';
+    env.TERM_PROGRAM = env.TERM_PROGRAM || 'ghostty';
+    env.COLORTERM = env.COLORTERM || 'truecolor';
+
+    try {
+      this.term = pty.spawn(this.shell, ['-l', '-i'], {
+        name: env.TERM,
+        cols: this.cols,
+        rows: this.rows,
+        cwd: this.cwd,
+        env,
+      });
+    } catch (e) {
+      // Retry without login flag
+      this.term = pty.spawn(this.shell, ['-i'], {
+        name: env.TERM,
+        cols: this.cols,
+        rows: this.rows,
+        cwd: this.cwd,
+        env,
+      });
+    }
 
     this.term.onData((data) => {
       this.buffer += data;
@@ -129,7 +196,9 @@ export function stripAnsi(s) {
 }
 
 export function defaultShell() {
-  if (process.env.SHELL) return process.env.SHELL;
-  if (os.platform() === 'darwin') return '/opt/homebrew/bin/fish';
-  return '/bin/bash';
+  return resolveShell();
 }
+
+// silence unused import lint for fileURLToPath if any
+void fileURLToPath;
+void os;

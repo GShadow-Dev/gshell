@@ -8,7 +8,7 @@
   },
   "scripts": {
     "gex": "node bin/gex.js",
-    "postinstall": "node scripts/install-fish.js"
+    "postinstall": "node scripts/fix-pty.js && node scripts/install-fish.js"
   },
   "engines": {
     "node": ">=20"
