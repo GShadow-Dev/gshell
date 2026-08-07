@@ -1,60 +1,69 @@
 # gShell / gex
 
-**Terminal autopilot for Ghostty.** Gengar drives your live fish shell.
+**Terminal autopilot for Ghostty.** Gengar possesses your live fish shell.
 
-No special app UI. Native TTY only. A dancing fire-Gengar on the left is the sole chrome.
+Native TTY only. Bottom status sprite (no scroll poison). Enter steers. Room memory survives the gap.
 
-## gex
+## Quick start
 
 ```fish
+cd ~/Documents/gshell && npm install   # once
 gex show me system stats
-gex scaffold a nextjs app called dashboard
-gex find a file with fzf and open it
+gex please update homebrew apps
+gex recall brew                       # dump memory pack
 ```
 
-### What you see
-- Your real terminal output (PTY) — full fidelity, fzf/wizards/tab work
-- Fire Gengar sprite on the left, hands dancing while he works
-- Bottom `steer>` — type and hit Enter to redirect him mid-flight
+Requires: Ghostty, fish, Node 20+, chafa, `DEEPSEEK_API_KEY`.
 
-### What he can do
-- Type commands (land in the driven session’s history)
-- Tab, arrows, ctrl-c, ctrl-r, menus, interactive installers
-- Pick settings himself (Next.js flags, package managers) — no handoff
+## What you get
 
-### Steer
-| Input | Effect |
+| Piece | Behavior |
 |---|---|
-| type + Enter | STEER message to Gengar |
-| `stop` / `abort` | End autopilot |
-| Ctrl-C | ctrl-c into driven shell |
-| Ctrl-C twice | Abort gex |
+| **Pilot** | Live PTY — tab, arrows, ctrl-*, brew y/n, wizards |
+| **Surface** | Gengar status on the **bottom row only** (states: thinking/casting/watching/speaking) |
+| **Steer** | Type + Enter while he works · `stop` aborts · Ctrl-C → shell · twice → abort gex |
+| **Watch mode** | Long jobs (brew/npm/cargo) don’t burn LLM steps |
+| **Memory** | Per-room ledger + blobs + session distill · summon pack + `memory_search` |
+| **Scribe** | Fish hooks log *your* commands between summons |
 
-## Install
+## Memory layout
 
-```fish
-cd ~/Documents/gshell   # or clone GShadow-Dev/gshell
-npm install             # builds node-pty + installs fish wrapper
+```text
+~/.cache/gex/
+  rooms/<room_id>/
+    ledger.ndjson      # append-only events
+    blobs/*.txt        # full command screens
+    summaries/         # distilled session cards
+  scribe/<tty>.ndjson  # your cmds while gex sleeps
+  last-exit.json
 ```
 
-Requires: Ghostty, fish, Node 20+, `chafa`, `DEEPSEEK_API_KEY`.
+Room id ≈ host + tty + parent fish pid. Same tab → same brain.
 
-```fish
-# key already in conf.d on this machine:
-# ~/.config/fish/conf.d/20-deepseek.fish
+## Architecture
+
+```text
+Surface (Gengar bar + steer) → Pilot (PTY + watch + confirms) → Mind (LLM)
+                                      ↓
+                              Memory (ledger/graph-ready/retrieve)
 ```
 
-## Layout
+## Project
 
-```
-bin/gex.js           CLI
-src/cli.js           autopilot wiring
-src/pty_session.js   live PTY mirror
-src/agent.js         model loop (submit/type/key/wait/done)
-src/gengar.js        dancing sprite (kitty/chafa)
-src/steer.js         keyboard → steer queue
+```text
+bin/gex.js
+src/cli.js
+src/agent.js
+src/gengar.js
+src/pty_session.js
+src/steer.js
+src/term_queries.js
+src/pilot/watch.js
+src/memory/{room,ledger,retrieve,distill}.js
 assets/fire-gengar.png
 ```
 
 ## Brand
-Ember Glass · GShadow · Fincher Labs
+
+Ember Glass · GShadow · Fincher Labs  
+*Green dashboards lie. I check the bodies.*
