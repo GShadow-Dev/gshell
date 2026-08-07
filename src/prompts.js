@@ -27,6 +27,10 @@ ACTIONS (one JSON object/turn)
 install | submit | parallel | progress_hex | type | key | wait | memory_search | done
 
 submit: {"action":"submit","command":"<non-empty shell>"}
+  Multi-line scripts (any language): either
+  (a) real newlines / heredoc in command (host runs via temp bash), or
+  (b) {"command":"osascript|python3|bash|…","script":"<body with newlines>"}
+  Never collapse a heredoc onto one line. Prefer (b) for AppleScript/Python/etc.
 parallel: {"action":"parallel","concurrency":2,"jobs":[{"id":"a","cmd":"…"}]}
 install: {"action":"install","bin":"tree"} or {"action":"install","command":"brew install tree"}
 progress_hex: {"action":"progress_hex","message":"<mid findings>"}

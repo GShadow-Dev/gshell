@@ -1,11 +1,16 @@
-# gex enter bind — everything after `gex` becomes one literal task string.
-# Apostrophes in natural language never break fish parsing.
+# gex enter bind — only rewrite natural-language `gex …` lines.
+# Everything else (including heredocs / multi-line) uses normal fish execute.
 
 if not status is-interactive
     exit
 end
 
 function __gex_protect_commandline --description 'Escape gex task as one fish string'
+    # Never rewrite inside the autopilot-driven PTY
+    if set -q GEX_AUTOPILOT
+        return 0
+    end
+
     set -l line (commandline | string collect)
     set -l trimmed (string trim -- $line)
     test -n "$trimmed"; or return 0
@@ -28,15 +33,27 @@ function __gex_protect_commandline --description 'Escape gex task as one fish st
     if string match -qr '^gex\s+' -- $trimmed
         set -l rest (string replace -r '^gex\s+' '' -- $trimmed)
         test -n "$rest"; or return 0
-        # script-style escape includes surrounding quotes
         set -l esc (string escape --style=script -- $rest)
         commandline -r -- "gex -- $esc"
     end
     return 0
 end
 
-function __gex_bind_execute --description 'Enter: protect gex then execute'
-    __gex_protect_commandline
+function __gex_bind_execute --description 'Enter: protect gex tasks only, else normal execute'
+    # Autopilot PTY: never intercept — multi-line + heredocs must work
+    if set -q GEX_AUTOPILOT
+        commandline -f execute
+        return
+    end
+
+    set -l buf (commandline | string collect)
+    set -l trimmed (string trim -- $buf)
+
+    # Only touch single-line gex invocations
+    if string match -qr '^gex(\s|$)' -- $trimmed; and not string match -q '*\n*' -- $buf
+        __gex_protect_commandline
+    end
+
     commandline -f execute
 end
 

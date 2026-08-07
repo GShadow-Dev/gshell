@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { createRequire } from 'node:module';
@@ -177,8 +178,38 @@ export class PtySession {
     this.term.write(keyToBytes(name));
   }
 
+  /**
+   * Submit a shell command.
+   * Multi-line / heredoc → write a temp bash script and run it (fish interactive
+   * binds and quoting are hostile to bash-style heredocs typed live).
+   */
   async submit(line) {
-    await this.type(String(line));
+    const s = String(line ?? '');
+    if (!s.trim()) {
+      await this.key('enter');
+      return;
+    }
+
+    const multiline =
+      s.includes('\n') ||
+      /<<\s*['-]?\w+/.test(s) ||
+      /<<\s*\\?\w+/.test(s);
+
+    if (multiline) {
+      const tmp = path.join(
+        os.tmpdir(),
+        `gex-run-${process.pid}-${Date.now()}.sh`,
+      );
+      const body = s.endsWith('\n') ? s : `${s}\n`;
+      fs.writeFileSync(tmp, body, { mode: 0o700 });
+      // bash runs the script; always rm. Quote path for fish.
+      const q = `'${tmp.replace(/'/g, `'\\''`)}'`;
+      await this.type(`bash ${q}; rm -f ${q}`);
+      await this.key('enter');
+      return;
+    }
+
+    await this.type(s);
     await this.key('enter');
   }
 

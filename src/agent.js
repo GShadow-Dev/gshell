@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { sleep } from './keys.js';
 import { rewriteCommand, promptAfterMark } from './pilot/watch.js';
 import { InteractiveAutopilot } from './pilot/interactive.js';
@@ -316,7 +319,23 @@ export async function runAgent({
       }
 
       if (kind === 'submit') {
-        const line = rewriteCommand(action.command || action.text || '');
+        let line = rewriteCommand(action.command || action.text || '');
+        // Models often emit \\n instead of real newlines for heredocs/scripts.
+        if (line && !line.includes('\n') && /\\n/.test(line)) {
+          line = line.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+        }
+        // Optional script body → temp file. General (any interpreter).
+        // {"action":"submit","command":"osascript","script":"…"}
+        // {"action":"submit","command":"python3","script":"…"}
+        const scriptBody = first(
+          action.script,
+          action.body,
+          action.stdin,
+          action.applescript,
+        );
+        if (scriptBody) {
+          line = materializeScript(line || 'bash', scriptBody);
+        }
         if (!line) {
           messages.push({ role: 'user', content: REJECT.emptySubmit });
           continue;
@@ -751,4 +770,33 @@ async function callModel(apiKey, messages) {
 function clip(s, n) {
   s = String(s || '');
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
+
+/** Write body to temp file; return `<runner> <file>; rm -f <file>`. General. */
+function materializeScript(runner, body) {
+  let text = String(body || '');
+  if (!text.includes('\n') && /\\n/.test(text)) {
+    text = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+  }
+  if (!text.trim()) return '';
+  const base =
+    String(runner || 'bash')
+      .trim()
+      .split(/\s+/)[0] || 'bash';
+  const bin = base.replace(/.*\//, '');
+  const ext = /osascript/i.test(bin)
+    ? '.applescript'
+    : /python/i.test(bin)
+      ? '.py'
+      : /node|bun/i.test(bin)
+        ? '.js'
+        : /ruby/i.test(bin)
+          ? '.rb'
+          : /perl/i.test(bin)
+            ? '.pl'
+            : '.sh';
+  const tmp = path.join(os.tmpdir(), `gex-${process.pid}-${Date.now()}${ext}`);
+  fs.writeFileSync(tmp, text.endsWith('\n') ? text : `${text}\n`, { mode: 0o600 });
+  const q = `'${tmp.replace(/'/g, `'\\''`)}'`;
+  return `${bin} ${q}; rm -f ${q}`;
 }
