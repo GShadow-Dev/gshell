@@ -1,5 +1,5 @@
 import { sleep } from './keys.js';
-import { isLongJob, rewriteCommand } from './pilot/watch.js';
+import { rewriteCommand, promptAfterMark, isShellPrompt } from './pilot/watch.js';
 import { InteractiveAutopilot } from './pilot/interactive.js';
 import { searchBlobs } from './memory/retrieve.js';
 
@@ -25,7 +25,6 @@ export async function runAgent({
 
   track('session_start', { actor: 'gex', task, cwd: process.cwd() });
 
-  // Reactive layer: detect prompt → tiny AI decide → type (ms, not main loop)
   const auto = new InteractiveAutopilot(session, {
     gengar,
     track,
@@ -33,6 +32,7 @@ export async function runAgent({
     apiKey,
   });
   auto.start();
+
   const messages = [
     { role: 'system', content: systemPrompt(task, memoryPack) },
     {
@@ -62,7 +62,13 @@ export async function runAgent({
         const msg = action.message || action.reason || 'Done.';
         track('gex_reply', { actor: 'gex', text: msg });
         gengar?.setState('speaking', 'hex');
-        return { ok: true, message: msg, steps: step, sessionEvents, autoLog: auto.log };
+        return {
+          ok: true,
+          message: msg,
+          steps: step,
+          sessionEvents,
+          autoLog: auto.log,
+        };
       }
 
       if (kind === 'memory_search') {
@@ -83,14 +89,12 @@ export async function runAgent({
         const ms = clamp(+action.ms || 700, 100, 20_000);
         gengar?.setState('watching', `${ms}ms`);
         await session.waitFor({ quietMs: ms, timeoutMs: ms + 400 });
-        // Include auto log so mind knows y/ctrl-c already happened
         pushScreen(messages, session, `wait ${ms}ms auto=${fmtAuto(auto)}`);
         continue;
       }
 
       if (kind === 'key') {
         const keys = action.keys || (action.key ? [action.key] : []);
-        // Skip redundant y if autopilot already answered
         if (
           auto.answeredConfirm &&
           keys.length === 1 &&
@@ -124,24 +128,26 @@ export async function runAgent({
 
       if (kind === 'submit') {
         const line = rewriteCommand(action.command || action.text || '', task);
-        // Reset per-command autopilot flags for confirm; keep cancelIntent
         auto.answeredConfirm = false;
-        // cancel only once per task unless mind resets
         gengar?.act(clip(line, 40));
         track('cmd_start', { actor: 'gex', cmd: line });
         const t0 = Date.now();
+
+        // Mark buffer BEFORE submit so we never confuse old prompt with done
+        const mark = session.buffer.length;
         await session.submit(line);
 
-        const useWatch = isLongJob(line) || action.watch || auto.cancelIntent;
-        const result = await watchUntilDone(session, {
+        // DYNAMIC: every submit watches until NEW prompt (or steer/timeout)
+        const timeoutMs = +action.timeout_ms || 900_000; // 15 min default
+        const result = await watchUntilPrompt(session, {
+          mark,
           gengar,
           steerQueue,
           auto,
-          timeoutMs: +action.timeout_ms || (useWatch ? 600_000 : 180_000),
-          quietMs: useWatch ? 1800 : (+action.quiet_ms || 500),
+          timeoutMs,
         });
 
-        const out = session.screenText(14000);
+        const out = session.screenText(16000);
         const ref = ledger?.putBlob(out, 'cmd');
         track('cmd_end', {
           actor: 'gex',
@@ -149,20 +155,19 @@ export async function runAgent({
           exit: result.exitHint,
           duration_ms: Date.now() - t0,
           blob_ref: ref,
-          tags: useWatch ? ['long_job'] : [],
+          tags: ['watched'],
           auto: fmtAuto(auto),
         });
         messages.push({
           role: 'user',
-          content: `TOOL_RESULT submit reason=${result.reason} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}\n--- END ---`,
+          content: `TOOL_RESULT submit reason=${result.reason} elapsed_ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}\n--- END ---`,
         });
 
-        // If task wanted cancel+cleanup and we cancelled, nudge mind to rm
         if (auto.cancelled && auto.cleanupIntent) {
           messages.push({
             role: 'user',
             content:
-              'NOTE: Autopilot already sent ctrl-c mid-install. If leftover project dirs exist from this task, submit rm -rf on them, then done.',
+              'NOTE: Autopilot sent ctrl-c mid-install. If leftover dirs exist from this task, submit rm -rf on them, then done.',
           });
         }
         continue;
@@ -183,42 +188,60 @@ export async function runAgent({
   }
 }
 
-async function watchUntilDone(session, { gengar, steerQueue, auto, timeoutMs, quietMs }) {
-  gengar?.setState('watching', auto.cancelIntent ? 'watch+cancel' : 'long job');
+/**
+ * Wait until the shell shows a prompt that appears AFTER mark.
+ * Progress/output can keep flowing for minutes (nmap, brew) — we do not
+ * burn Mind steps; we just watch. AI snap-decides only if a prompt appears.
+ */
+async function watchUntilPrompt(
+  session,
+  { mark, gengar, steerQueue, auto, timeoutMs },
+) {
+  gengar?.setState('watching', 'run');
   const start = Date.now();
+  let lastLen = session.buffer.length;
+  let lastGrowth = Date.now();
   let lastBeat = 0;
 
   while (Date.now() - start < timeoutMs) {
     if (steerQueue?.length) return { reason: 'steer', exitHint: null };
+    if (session.exited) return { reason: 'exited', exitHint: session.exitCode };
 
-    // Autopilot may have cancelled — wait for prompt after SIGINT
-    const quiet = await session.waitFor({ quietMs, timeoutMs: quietMs + 800 });
-    if (quiet.ok && quiet.reason === 'quiet') {
-      const tail = session.screenText(500);
-      if (isShellPrompt(tail) || session.exited) {
-        return { reason: auto.cancelled ? 'cancelled' : 'prompt', exitHint: auto.cancelled ? 130 : 0 };
-      }
-      // quiet but not prompt — keep watching if long install without cancel done
-      if (!auto.cancelIntent) {
-        // still running silently?
-        if (Date.now() - start > 5000 && isShellPrompt(tail)) {
-          return { reason: 'prompt', exitHint: 0 };
-        }
+    const len = session.buffer.length;
+    if (len !== lastLen) {
+      lastLen = len;
+      lastGrowth = Date.now();
+    }
+
+    // Done only when we have NEW content past mark AND a prompt
+    if (promptAfterMark(session, mark)) {
+      // Require a brief quiet so we don't cut mid-line
+      const quietFor = Date.now() - lastGrowth;
+      if (quietFor >= 450) {
+        return {
+          reason: auto.cancelled ? 'cancelled' : 'prompt',
+          exitHint: auto.cancelled ? 130 : 0,
+        };
       }
     }
 
     if (Date.now() - lastBeat > 2000) {
-      const tag = auto.cancelled ? 'cancelling' : auto.answeredConfirm ? 'running' : 'waiting';
-      gengar?.setState('watching', `${tag} ${Math.round((Date.now() - start) / 1000)}s`);
+      const s = Math.round((Date.now() - start) / 1000);
+      const flowing = Date.now() - lastGrowth < 1500;
+      const tag = auto.cancelled
+        ? 'cancelling'
+        : flowing
+          ? 'running'
+          : auto.answeredConfirm
+            ? 'running'
+            : 'waiting';
+      gengar?.setState('watching', `${tag} ${s}s`);
       lastBeat = Date.now();
     }
-    await sleep(80);
+
+    await sleep(100);
   }
   return { reason: 'timeout', exitHint: null };
-}
-
-function isShellPrompt(tail) {
-  return /[❯╰─>$%#]\s*$/m.test(tail) || /gsh\/\d+/.test(tail) || /fish\s*$/m.test(tail);
 }
 
 function fmtAuto(auto) {
@@ -276,14 +299,16 @@ async function callModel(apiKey, messages) {
   }
 }
 
-function systemPrompt(task, memoryPack) {
+function systemPrompt(task) {
   return `You are Gengar — terminal AUTOPILOT (gex) in Ghostty.
 
-You drive a LIVE fish shell. A FAST reactive layer detects prompts and asks YOU
-(tiny separate completion, max_tokens=24, ~instant) what to type — y/n, numbers,
-or Type DELETE tokens. It is not hard-coded to always press y.
-If TASK asks to cancel mid-install → ctrl-c once install progress appears.
-Do NOT burn main-loop steps on y/n. Prefer submit once; observe SCREEN + auto log.
+You drive a LIVE fish shell. After every submit, the host DYNAMICALLY waits until
+the shell prompt returns (minutes-long nmap/brew/npm are fine). You do NOT need
+to poll. You get one TOOL_RESULT when the command finishes.
+
+Interactive prompts (y/n, menus, Type DELETE) are answered by a separate FAST
+AI micro-decision on the byte stream — not hard-coded. You may see y/n appear
+on SCREEN without spending a main-loop step.
 
 ## JSON every turn (no fences)
 {
@@ -295,28 +320,16 @@ Do NOT burn main-loop steps on y/n. Prefer submit once; observe SCREEN + auto lo
   "key": "enter",
   "keys": ["y"],
   "query": "for memory_search",
-  "watch": true,
-  "timeout_ms": 120000
+  "timeout_ms": 900000
 }
 
-## Actions
-- submit: one command + Enter. Use full create-next-app flags. Host watches + auto y/cancel.
-- type/key: only if reactive layer did not handle a prompt (password → done asking user).
-- memory_search: dig room memory
-- done: HEX result for the human
-
-## Cancel+cleanup tasks
-If TASK says cancel during install and delete files:
-1. submit create-next-app (with flags) once
-2. Host auto y + ctrl-c
-3. On TOOL_RESULT with cxl=1, submit rm -rf <dir>
-4. done
-
-## Memory
-MEMORY pack is incomplete by design. Use memory_search when needed.
-
-## Safety
-No sudo/rm -rf / / force-push/curl|sh unless demanded. Password → needs user.
+## Rules
+- Prefer few submits that finish; don't spam short waits for long scans.
+- nmap -O needs root — use -sV without sudo unless user asked for root.
+- After fingerprint/scan TOOL_RESULT, action=done with a clear summary.
+- Cancel+cleanup tasks: submit install once; host may ctrl-c; then rm -rf; done.
+- Password → done asking user (never invent secrets).
+- memory_search digs room history.
 
 Task: ${task}
 `;
@@ -330,3 +343,7 @@ function clip(s, n) {
   s = String(s || '');
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
+
+// silence unused import if tree-shaken
+void isShellPrompt;
+void clamp;
