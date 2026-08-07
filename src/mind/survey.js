@@ -86,11 +86,32 @@ function listPathExecutables() {
   }
   return [...names].sort();
 }
-    'package-lock.json', 'Cargo.toml', 'go.mod', 'pyproject.toml',
-    'requirements.txt', 'uv.lock', 'Dockerfile', 'compose.yml',
-    'docker-compose.yml', 'Makefile', 'justfile', 'Justfile',
-    'tsconfig.json', 'next.config.js', 'next.config.mjs', 'next.config.ts',
-    'README.md', '.git',
+
+function listMarkers(cwd) {
+  const names = [
+    'package.json',
+    'package-lock.json',
+    'pnpm-lock.yaml',
+    'yarn.lock',
+    'bun.lock',
+    'bun.lockb',
+    'Cargo.toml',
+    'go.mod',
+    'pyproject.toml',
+    'requirements.txt',
+    'uv.lock',
+    'Dockerfile',
+    'compose.yml',
+    'docker-compose.yml',
+    'Makefile',
+    'justfile',
+    'Justfile',
+    'tsconfig.json',
+    'next.config.js',
+    'next.config.mjs',
+    'next.config.ts',
+    'README.md',
+    '.git',
   ];
   return names.filter((n) => {
     try {
