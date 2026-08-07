@@ -1,15 +1,13 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
 import pty from 'node-pty';
 import { keyToBytes, sleep } from './keys.js';
+import { TermQueryFilter } from './term_queries.js';
 
 const require = createRequire(import.meta.url);
 
-/** node-pty's spawn-helper must be +x or posix_spawnp fails on macOS. */
 function ensureSpawnHelperExecutable() {
   try {
     const ptyPkg = path.dirname(require.resolve('node-pty/package.json'));
@@ -19,9 +17,7 @@ function ensureSpawnHelperExecutable() {
       for (const name of fs.readdirSync(dir)) {
         const p = path.join(dir, name);
         if (fs.statSync(p).isDirectory()) walk(p);
-        else if (name === 'spawn-helper') {
-          fs.chmodSync(p, 0o755);
-        }
+        else if (name === 'spawn-helper') fs.chmodSync(p, 0o755);
       }
     };
     walk(pre);
@@ -48,6 +44,28 @@ function resolveShell() {
   return '/bin/bash';
 }
 
+/** Env for the driven shell — no Ghostty integration, no greeting noise. */
+function childEnv() {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v === undefined || v === null) continue;
+    // Drop Ghostty shell-integration injection so the child does not probe us
+    if (k.startsWith('GHOSTTY_')) continue;
+    if (k === 'TERMINFO' && String(v).includes('ghostty')) continue;
+    env[k] = String(v);
+  }
+  env.GEX_AUTOPILOT = '1';
+  // Standard xterm — fewer proprietary probes than xterm-ghostty
+  env.TERM = 'xterm-256color';
+  env.COLORTERM = 'truecolor';
+  // Keep TERM_PROGRAM for tools that check it, but integration vars are gone
+  env.TERM_PROGRAM = 'gex';
+  env.TERM_PROGRAM_VERSION = '0.1.0';
+  // Silence fish greeting inside autopilot session
+  env.fish_greeting = '';
+  return env;
+}
+
 export class PtySession {
   constructor(opts = {}) {
     this.shell = opts.shell || resolveShell();
@@ -59,54 +77,43 @@ export class PtySession {
     this.term = null;
     this.exited = false;
     this.exitCode = null;
+    this._filter = null;
   }
 
   start() {
     if (!process.stdout.isTTY) {
       throw new Error('gex needs a real Ghostty TTY');
     }
-
     ensureSpawnHelperExecutable();
-
     if (!fs.existsSync(this.shell)) {
       throw new Error(`shell not found: ${this.shell}`);
     }
 
-    // Clean env — strip empty values that can confuse spawn
-    const env = {};
-    for (const [k, v] of Object.entries(process.env)) {
-      if (v !== undefined && v !== null) env[k] = String(v);
-    }
-    env.GEX_AUTOPILOT = '1';
-    env.TERM = env.TERM || 'xterm-256color';
-    env.TERM_PROGRAM = env.TERM_PROGRAM || 'ghostty';
-    env.COLORTERM = env.COLORTERM || 'truecolor';
+    const env = childEnv();
 
-    try {
-      this.term = pty.spawn(this.shell, ['-l', '-i'], {
-        name: env.TERM,
-        cols: this.cols,
-        rows: this.rows,
-        cwd: this.cwd,
-        env,
-      });
-    } catch (e) {
-      // Retry without login flag
-      this.term = pty.spawn(this.shell, ['-i'], {
-        name: env.TERM,
-        cols: this.cols,
-        rows: this.rows,
-        cwd: this.cwd,
-        env,
-      });
-    }
+    this.term = pty.spawn(this.shell, ['-i'], {
+      name: 'xterm-256color',
+      cols: this.cols,
+      rows: this.rows,
+      cwd: this.cwd,
+      env,
+    });
+
+    this._filter = new TermQueryFilter((bytes) => {
+      try {
+        this.term.write(bytes);
+      } catch {
+        /* ignore */
+      }
+    });
 
     this.term.onData((data) => {
-      this.buffer += data;
+      const display = this._filter.push(data);
+      this.buffer += display;
       if (this.buffer.length > this.maxBuffer) {
         this.buffer = this.buffer.slice(-this.maxBuffer);
       }
-      process.stdout.write(data);
+      if (display) process.stdout.write(display);
     });
 
     this.term.onExit(({ exitCode }) => {
@@ -124,6 +131,17 @@ export class PtySession {
       }
     };
     process.stdout.on('resize', this._onResize);
+
+    // Prime: disable fish greeting if still active
+    setTimeout(() => {
+      try {
+        // Clear any half-open probe state and show a clean prompt
+        this.term.write('\x15'); // ctrl-u
+      } catch {
+        /* ignore */
+      }
+    }, 50);
+
     return this;
   }
 
@@ -198,7 +216,3 @@ export function stripAnsi(s) {
 export function defaultShell() {
   return resolveShell();
 }
-
-// silence unused import lint for fileURLToPath if any
-void fileURLToPath;
-void os;

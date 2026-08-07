@@ -31,9 +31,14 @@ export async function main(argv) {
     cwd: process.cwd(),
   }).start();
 
-  // Let fish draw (greeting may paint under gengar; gengar keeps dancing on top)
-  await session.waitFor({ quietMs: 800, timeoutMs: 10_000 });
-  gengar.paint();
+  // Nested shell settles (queries answered by TermQueryFilter)
+  await session.waitFor({ quietMs: 600, timeoutMs: 12_000 });
+  // Nudge a clean prompt if still quiet/empty
+  if (session.screenText().trim().length < 5) {
+    await session.key('enter');
+    await session.waitFor({ quietMs: 400, timeoutMs: 5_000 });
+  }
+  gengar.paint(true);
 
   const steerQueue = [];
   let aborted = false;
