@@ -1,7 +1,6 @@
 /**
  * Dynamic run detection — NOT a tool allowlist.
- * A command is "still running" if we haven't seen a NEW shell prompt
- * after the submit, or output is still flowing.
+ * Done = NEW content after submit mark AND that new content ends with a shell prompt.
  */
 
 export function riskForCommand(cmd) {
@@ -25,7 +24,6 @@ export function rewriteCommand(cmd, task) {
   if (/\bnpx\s+/.test(c) && !/\bnpx\s+--yes\b/.test(c) && !/\bnpx\s+-y\b/.test(c)) {
     c = c.replace(/\bnpx\b/, 'npx --yes');
   }
-  // OS fingerprint without root usually dies — drop -O unless sudo/root requested
   if (/\bnmap\b/i.test(c) && /\s-O\b/.test(c) && !/\bsudo\b/i.test(c) && !/\broot\b/i.test(t)) {
     c = c.replace(/\s-O\b/g, ' ');
     if (!/\s-sV\b/.test(c)) c = c.replace(/\bnmap\b/, 'nmap -sV');
@@ -33,38 +31,40 @@ export function rewriteCommand(cmd, task) {
   return c;
 }
 
-/** Shell prompt heuristics (fish/zsh/bash/starship/gsh). */
+function stripAnsi(s) {
+  return String(s || '')
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '');
+}
+
+/** Shell prompt heuristics on a text chunk (usually the post-command delta). */
 export function isShellPrompt(text) {
-  const tail = String(text || '').slice(-600);
-  // Prefer last non-empty lines
+  const tail = stripAnsi(text).slice(-800);
   const lines = tail.split('\n').filter((l) => l.trim().length);
-  const last = lines.slice(-3).join('\n');
+  if (!lines.length) return false;
+  // Only the LAST line can be the live prompt
+  const last = lines[lines.length - 1];
   return (
     /╰─\s*gsh\/\d+/i.test(last) ||
-    /gsh\/\d+\s*$/m.test(last) ||
-    /[❯›]\s*$/m.test(last) ||
-    /\$\s*$/m.test(last) ||
-    /%\s*$/m.test(last) ||
-    /#\s*$/m.test(last) ||
-    /fish\s*$/m.test(last)
+    /gsh\/\d+\s*$/i.test(last) ||
+    /[❯›]\s*$/.test(last) ||
+    /\$\s*$/.test(last) ||
+    /%\s*$/.test(last) ||
+    /#\s*$/.test(last)
   );
 }
 
 /**
- * True if the buffer grew past mark and then shows a prompt
- * that wasn't only the pre-command leftover.
+ * True when buffer grew past mark and the NEW slice ends with a prompt.
  */
 export function promptAfterMark(session, mark) {
   if (session.exited) return true;
-  if (session.buffer.length <= mark + 2) return false;
-  // New content since mark
-  const delta = session.buffer.slice(mark);
-  const stripped = delta
-    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, '')
-    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '');
-  // Need real output or at least a newline then prompt
-  if (stripped.trim().length < 1) return false;
-  return isShellPrompt(session.screenText(800));
+  if (session.buffer.length <= mark + 1) return false;
+  const delta = stripAnsi(session.buffer.slice(mark));
+  // Must have more than just the echoed command line
+  if (delta.trim().length < 2) return false;
+  return isShellPrompt(delta);
 }
 
 export { classifyTail } from './interactive.js';
