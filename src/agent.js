@@ -9,6 +9,7 @@ import {
 import { searchBlobs } from './memory/retrieve.js';
 import { surveyMachine, formatSurvey } from './mind/survey.js';
 import { Toolkit } from './mind/toolkit.js';
+import { SYSTEM, userBrief, REJECT } from './prompts.js';
 
 const API = 'https://api.deepseek.com/chat/completions';
 
@@ -54,22 +55,18 @@ export async function runAgent({
   const progressNotes = [];
 
   const messages = [
-    { role: 'system', content: systemPrompt() },
+    { role: 'system', content: SYSTEM },
     {
       role: 'user',
-      content: [
-        `TASK:\n${task}`,
-        `--- SURVEY ---\n${surveyText}`,
-        `--- TOOLKIT CATALOG ---\n${toolkit.formatCatalog()}`,
-        `--- PRIOR PLAYBOOK ---\n${toolkit.formatPlaybook(playbook)}`,
-        `--- MEMORY ---\n${memoryPack || '(empty)'}`,
-        `--- SCREEN ---\n${session.screenText()}`,
-        efficiency
-          ? `--- SEEDED EFFICIENCY ---\n${JSON.stringify(efficiency)}\nYou may efficiency_accept:true or replace with a better efficiency object.`
-          : '--- SEEDED EFFICIENCY ---\n(none)',
-        'Before any submit/parallel/install: include efficiency{...} OR efficiency_accept:true.',
-        'Prefer the best tool for the job. If the best tool is missing and can_install allows it, action=install first (e.g. tree for directory trees, not ls -R).',
-      ].join('\n\n'),
+      content: userBrief({
+        task,
+        surveyText,
+        catalog: toolkit.formatCatalog(),
+        playbook: toolkit.formatPlaybook(playbook),
+        memoryPack,
+        screen: session.screenText(),
+        seededEfficiency: efficiency,
+      }),
     },
   ];
 
@@ -95,103 +92,28 @@ export async function runAgent({
         track('efficiency', { actor: 'gex', text: 'accept_seed' });
       }
 
-      if (
-        !efficiencyLocked &&
-        step <= 2 &&
-        !['done', 'reply', 'memory_search'].includes(action.action)
-      ) {
-        if (!action.efficiency && !action.efficiency_accept) {
-          messages.push({
-            role: 'user',
-            content:
-              'REJECTED: need efficiency card first. Ask yourself: what is the best tool for THIS task given SURVEY? Is a better tool missing that we should install? Chain? Parallel? Then emit efficiency{goal,approach,tools,best_tool,steps,parallel,concurrency,install,progressive_hex,risk,why} and your next action.',
-          });
-          continue;
-        }
-      }
+      const kind = String(action.action || (action.efficiency ? 'plan' : ''))
+        .toLowerCase()
+        .trim();
+      const cmdPeek = peekCmd(action);
 
-      track('gex_act', {
-        actor: 'gex',
-        action: action.action,
-        cmd: action.command || action.text || action.install_cmd || '',
+      const reject = gate({
+        kind,
+        efficiencyLocked,
+        hasEff: Boolean(action.efficiency || action.efficiency_accept),
+        cmdPeek,
+        ranCommands,
+        message: action.message || action.reason || '',
       });
-
-      const kind = action.action || 'done';
-
-      // --- INSTALL better tool (system-wide equip) ---
-      if (kind === 'install') {
-        let icmd =
-          action.command ||
-          action.install_cmd ||
-          (action.bin || action.tool
-            ? toolkit.installCommand(action.bin || action.tool, survey)
-            : null) ||
-          efficiency?.install?.cmd ||
-          null;
-
-        if (!icmd && (action.bin || action.tool || efficiency?.install?.bin)) {
-          icmd = toolkit.installCommand(
-            action.bin || action.tool || efficiency.install.bin,
-            survey,
-          );
-        }
-
-        if (!icmd) {
-          messages.push({
-            role: 'user',
-            content:
-              'install failed to resolve a command. Provide command: "brew install tree" (or cargo/npm/uv/go) based on can_install in SURVEY.',
-          });
-          continue;
-        }
-
-        icmd = rewriteCommand(icmd);
-        gengar?.act(clip(icmd, 40));
-        const mark = session.buffer.length;
-        track('cmd_start', { actor: 'gex', cmd: icmd, tags: ['install'] });
-        await session.submit(icmd);
-        const r = await watchUntilPrompt(session, {
-          mark,
-          gengar,
-          steerQueue,
-          auto,
-          timeoutMs: +action.timeout_ms || 600_000,
-        });
-        const out = session.screenText(14000);
-        ledger?.putBlob(out, 'install');
-        track('cmd_end', {
-          actor: 'gex',
-          cmd: icmd,
-          exit: r.exitHint,
-          tags: ['install'],
-        });
-        ranCommands.push(icmd);
-
-        const binName = normBin(
-          action.bin || action.tool || efficiency?.install?.bin || guessBin(icmd),
-        );
-        if (binName) {
-          toolkit.noteTool(binName, {
-            installed: true,
-            used: true,
-            purpose: action.why || efficiency?.install?.why || efficiency?.goal || '',
-            install_cmd: icmd,
-          });
-          // refresh survey bins after install
-          survey.path_bins = Array.from(
-            new Set([...(survey.path_bins || []), binName]),
-          ).sort();
-        }
-
-        messages.push({
-          role: 'user',
-          content: `TOOL_RESULT install reason=${r.reason} bin=${binName || '?'}\n$ ${icmd}\n--- SCREEN ---\n${out}\n\nContinue the task with the new tool if install succeeded.`,
-        });
+      if (reject) {
+        messages.push({ role: 'user', content: reject });
         continue;
       }
 
+      track('gex_act', { actor: 'gex', action: kind, cmd: cmdPeek });
+
       if (kind === 'done' || kind === 'reply') {
-        const msg = action.message || action.reason || 'Done.';
+        const msg = String(action.message || action.reason || '').trim();
         const finalMsg =
           progressNotes.length > 0
             ? `${progressNotes.map((p, i) => `[mid-${i + 1}] ${p}`).join('\n\n')}\n\n${msg}`
@@ -216,18 +138,53 @@ export async function runAgent({
         };
       }
 
+      if (kind === 'install') {
+        let icmd =
+          action.command ||
+          action.install_cmd ||
+          toolkit.installCommand(
+            action.bin || action.tool || efficiency?.install?.bin,
+            survey,
+          ) ||
+          efficiency?.install?.cmd ||
+          '';
+        icmd = rewriteCommand(icmd);
+        if (!icmd) {
+          messages.push({ role: 'user', content: REJECT.installNeed });
+          continue;
+        }
+        await execLine({
+          session,
+          line: icmd,
+          gengar,
+          steerQueue,
+          auto,
+          track,
+          ledger,
+          ranCommands,
+          toolkit,
+          survey,
+          messages,
+          timeoutMs: +action.timeout_ms || 600_000,
+          tags: ['install'],
+          binHint: action.bin || action.tool || efficiency?.install?.bin,
+          purpose: action.why || efficiency?.install?.why || '',
+        });
+        continue;
+      }
+
       if (kind === 'progress_hex' || kind === 'partial_hex') {
-        const note = action.message || action.text || '';
-        if (note) {
+        const note = String(action.message || action.text || '').trim();
+        if (note.length >= 12) {
           progressNotes.push(note);
           track('progress_hex', { actor: 'gex', text: note });
           gengar?.setState('speaking', 'update');
           onProgressHex?.(note);
-          messages.push({
-            role: 'user',
-            content: `PROGRESS_HEX shown to user. Continue until task complete.\n--- SCREEN ---\n${session.screenText()}`,
-          });
         }
+        messages.push({
+          role: 'user',
+          content: `${REJECT.afterProgress}\n--- SCREEN ---\n${session.screenText()}`,
+        });
         continue;
       }
 
@@ -237,10 +194,10 @@ export async function runAgent({
         const hits = searchBlobs(ledger, q, 4);
         messages.push({
           role: 'user',
-          content: `MEMORY_RESULT q=${q}\n${
-            hits.map((h) => `ref=${h.ref}\n${h.lines.join('\n')}`).join('\n---\n') ||
-            '(no hits)'
-          }\n--- SCREEN ---\n${session.screenText()}`,
+          content: `TOOL_RESULT memory q=${q}\n${
+            hits.map((h) => `${h.ref}\n${h.lines.join('\n')}`).join('\n---\n') ||
+            '∅'
+          }\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
         });
         continue;
       }
@@ -249,7 +206,10 @@ export async function runAgent({
         const ms = Math.max(100, Math.min(20_000, +action.ms || 700));
         gengar?.setState('watching', `${ms}ms`);
         await session.waitFor({ quietMs: ms, timeoutMs: ms + 400 });
-        pushScreen(messages, session, `wait auto=${fmtAuto(auto)}`);
+        messages.push({
+          role: 'user',
+          content: `TOOL_RESULT wait auto=${fmtAuto(auto)}\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
+        });
         continue;
       }
 
@@ -260,7 +220,10 @@ export async function runAgent({
           keys.length === 1 &&
           /^(y|enter)$/i.test(keys[0])
         ) {
-          pushScreen(messages, session, 'key skipped — already confirmed');
+          messages.push({
+            role: 'user',
+            content: `TOOL_RESULT key skipped\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
+          });
           continue;
         }
         gengar?.act(keys.join(' '));
@@ -269,30 +232,36 @@ export async function runAgent({
           await sleep(35);
         }
         await session.waitFor({ quietMs: 300, timeoutMs: 15_000 });
-        pushScreen(messages, session, `key ${keys.join(',')} auto=${fmtAuto(auto)}`);
+        messages.push({
+          role: 'user',
+          content: `TOOL_RESULT key ${keys.join(',')} auto=${fmtAuto(auto)}\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
+        });
         continue;
       }
 
       if (kind === 'type') {
         const text = String(action.text ?? '');
         if (auto.answeredConfirm && /^y(es)?$/i.test(text.trim())) {
-          pushScreen(messages, session, 'type skipped — already confirmed');
+          messages.push({
+            role: 'user',
+            content: `TOOL_RESULT type skipped\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
+          });
           continue;
         }
         gengar?.act(clip(text, 24));
         await session.type(text, { delayMs: +action.delay_ms || 0 });
         await session.waitFor({ quietMs: 250, timeoutMs: 10_000 });
-        pushScreen(messages, session, `type auto=${fmtAuto(auto)}`);
+        messages.push({
+          role: 'user',
+          content: `TOOL_RESULT type auto=${fmtAuto(auto)}\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
+        });
         continue;
       }
 
       if (kind === 'parallel' || kind === 'fanout') {
         const jobs = normalizeJobs(action.jobs || action.commands || []);
         if (!jobs.length) {
-          messages.push({
-            role: 'user',
-            content: 'parallel needs jobs:[{id,cmd}] or commands:[string]',
-          });
+          messages.push({ role: 'user', content: REJECT.parallelEmpty });
           continue;
         }
         const conc =
@@ -320,88 +289,68 @@ export async function runAgent({
         });
 
         for (const r of results) {
-          ranCommands.push(r.cmd);
-          const ref = ledger?.putBlob(r.out || '', `p-${r.id}`);
+          if (r.cmd?.trim()) ranCommands.push(r.cmd);
+          ledger?.putBlob(r.out || '', `p-${r.id}`);
           track('cmd_end', {
             actor: 'gex',
             cmd: r.cmd,
             exit: r.code,
             duration_ms: r.ms,
-            blob_ref: ref,
             tags: ['parallel'],
           });
+          const b = guessBin(r.cmd);
+          if (b) toolkit.noteTool(b, { used: true });
         }
 
-        const board = formatParallelBoard(results);
         messages.push({
           role: 'user',
-          content: `TOOL_RESULT parallel conc=${conc}\n${board}\n\nContinue, progress_hex, or done.`,
+          content: `TOOL_RESULT parallel conc=${conc}\n${formatParallelBoard(
+            results,
+          )}\n\n${REJECT.afterTool}`,
         });
         continue;
       }
 
       if (kind === 'submit') {
         const line = rewriteCommand(action.command || action.text || '');
-        auto.answeredConfirm = false;
-        gengar?.act(clip(line, 40));
-        track('cmd_start', { actor: 'gex', cmd: line });
-        const t0 = Date.now();
-        const mark = session.buffer.length;
-        await session.submit(line);
-
-        const result = await watchUntilPrompt(session, {
-          mark,
+        if (!line) {
+          messages.push({ role: 'user', content: REJECT.emptySubmit });
+          continue;
+        }
+        await execLine({
+          session,
+          line,
           gengar,
           steerQueue,
           auto,
+          track,
+          ledger,
+          ranCommands,
+          toolkit,
+          survey,
+          messages,
           timeoutMs: +action.timeout_ms || 900_000,
+          tags: [],
         });
-
-        const out = session.screenText(16000);
-        const ref = ledger?.putBlob(out, 'cmd');
-        track('cmd_end', {
-          actor: 'gex',
-          cmd: line,
-          exit: result.exitHint,
-          duration_ms: Date.now() - t0,
-          blob_ref: ref,
-          auto: fmtAuto(auto),
-        });
-        ranCommands.push(line);
-
-        const bin = guessBin(line);
-        if (bin) toolkit.noteTool(bin, { used: true });
-
-        messages.push({
-          role: 'user',
-          content: `TOOL_RESULT submit reason=${result.reason} elapsed_ms=${
-            Date.now() - t0
-          } auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}`,
-        });
-
         if (auto.cancelled && auto.cleanupIntent) {
-          messages.push({
-            role: 'user',
-            content:
-              'NOTE: Autopilot sent ctrl-c. Cleanup leftovers if needed, then done.',
-          });
+          messages.push({ role: 'user', content: REJECT.afterCancel });
         }
         continue;
       }
 
-      pushScreen(messages, session, `unknown action ${kind}`);
+      if (kind === 'done' || kind === 'reply') {
+        // handled above
+        continue;
+      }
+
+      messages.push({ role: 'user', content: REJECT.unknown(kind) });
     }
 
-    toolkit.recordWin({
-      task,
-      efficiency,
-      commands: ranCommands,
-      wall_ms: Date.now() - tSession,
-      ok: false,
-    });
     return {
       ok: false,
-      message: 'Step limit reached.',
+      message: ranCommands.length
+        ? `Step limit. Ran: ${ranCommands.join(' · ')}`
+        : 'Step limit; no commands run.',
       steps: maxSteps,
       sessionEvents,
       autoLog: auto.log,
@@ -413,12 +362,102 @@ export async function runAgent({
   }
 }
 
+function gate({ kind, efficiencyLocked, hasEff, cmdPeek, ranCommands, message }) {
+  if (!kind || kind === 'plan') {
+    return efficiencyLocked ? REJECT.planOnly : REJECT.needEfficiency;
+  }
+
+  if (
+    !efficiencyLocked &&
+    !hasEff &&
+    !['memory_search'].includes(kind)
+  ) {
+    return REJECT.needEfficiency;
+  }
+
+  if (kind === 'done' || kind === 'reply') {
+    const worked = ranCommands.some((c) => String(c || '').trim());
+    const msg = String(message || '').trim();
+    const hollow = !msg || /^done\.?$/i.test(msg) || msg.length < 24;
+    // pure chat exception: greetings only
+    const chatty = /^(hi|hello|hey)\b/i.test(msg) && msg.length < 80;
+    if (!worked && !chatty) return REJECT.doneNoWork;
+    if (worked && hollow) return REJECT.doneHollow;
+    if (!worked && hollow) return REJECT.doneNoWork;
+  }
+
+  if (kind === 'submit' && !String(cmdPeek || '').trim()) return REJECT.emptySubmit;
+
+  return null;
+}
+
+async function execLine({
+  session,
+  line,
+  gengar,
+  steerQueue,
+  auto,
+  track,
+  ledger,
+  ranCommands,
+  toolkit,
+  survey,
+  messages,
+  timeoutMs,
+  tags = [],
+  binHint = '',
+  purpose = '',
+}) {
+  auto.answeredConfirm = false;
+  gengar?.act(clip(line, 40));
+  track('cmd_start', { actor: 'gex', cmd: line, tags });
+  const t0 = Date.now();
+  const mark = session.buffer.length;
+  await session.submit(line);
+  const result = await watchUntilPrompt(session, {
+    mark,
+    gengar,
+    steerQueue,
+    auto,
+    timeoutMs,
+  });
+  const out = session.screenText(16000);
+  ledger?.putBlob(out, tags.includes('install') ? 'install' : 'cmd');
+  track('cmd_end', {
+    actor: 'gex',
+    cmd: line,
+    exit: result.exitHint,
+    duration_ms: Date.now() - t0,
+    tags,
+    auto: fmtAuto(auto),
+  });
+  ranCommands.push(line);
+  const bin = normBin(binHint || guessBin(line));
+  if (bin) {
+    toolkit.noteTool(bin, {
+      installed: tags.includes('install') || undefined,
+      used: true,
+      purpose,
+      install_cmd: tags.includes('install') ? line : undefined,
+    });
+    if (survey?.path_bins) {
+      survey.path_bins = Array.from(new Set([...survey.path_bins, bin])).sort();
+    }
+  }
+  messages.push({
+    role: 'user',
+    content: `TOOL_RESULT ${tags.includes('install') ? 'install' : 'submit'} reason=${result.reason} ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}\n\n${REJECT.afterTool}`,
+  });
+}
+
 function normalizeJobs(jobs) {
   if (!Array.isArray(jobs)) return [];
   return jobs
     .map((j, i) => {
-      if (typeof j === 'string') return { id: `j${i + 1}`, cmd: j };
-      if (j?.cmd) return { id: j.id || `j${i + 1}`, cmd: String(j.cmd), cwd: j.cwd };
+      if (typeof j === 'string' && j.trim()) return { id: `j${i + 1}`, cmd: j.trim() };
+      if (j?.cmd && String(j.cmd).trim()) {
+        return { id: j.id || `j${i + 1}`, cmd: String(j.cmd).trim(), cwd: j.cwd };
+      }
       return null;
     })
     .filter(Boolean);
@@ -504,17 +543,33 @@ function lastOutputHint(session, mark) {
   return last.length > 36 ? `${last.slice(0, 34)}…` : last;
 }
 
+function peekCmd(a) {
+  return (
+    first(
+      a.command,
+      a.install_cmd,
+      a.text,
+      Array.isArray(a.commands) ? a.commands[0] : '',
+      Array.isArray(a.jobs) ? a.jobs[0]?.cmd : '',
+    ) || ''
+  );
+}
+
+function first(...xs) {
+  for (const x of xs) {
+    if (x != null && String(x).trim()) return String(x).trim();
+  }
+  return '';
+}
+
 function guessBin(cmd) {
   const tok = String(cmd || '')
     .trim()
     .split(/\s+/)
     .find((t) => t && !t.includes('=') && !t.startsWith('-'));
-  return tok ? pathBasename(tok) : '';
-}
-
-function pathBasename(s) {
-  const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
-  return i >= 0 ? s.slice(i + 1) : s;
+  if (!tok) return '';
+  const i = Math.max(tok.lastIndexOf('/'), tok.lastIndexOf('\\'));
+  return i >= 0 ? tok.slice(i + 1) : tok;
 }
 
 function normBin(s) {
@@ -535,14 +590,7 @@ function drainSteers(q, messages, session, track, gengar) {
   for (const text of lines) track('steer', { actor: 'user', text });
   messages.push({
     role: 'user',
-    content: `STEER from user (obey immediately):\n${lines.join('\n')}\n\n--- SCREEN ---\n${session.screenText()}`,
-  });
-}
-
-function pushScreen(messages, session, note) {
-  messages.push({
-    role: 'user',
-    content: `TOOL_RESULT ${note}\n--- SCREEN ---\n${session.screenText()}`,
+    content: `STEER\n${lines.join('\n')}\n--- SCREEN ---\n${session.screenText()}`,
   });
 }
 
@@ -556,7 +604,7 @@ async function callModel(apiKey, messages) {
     body: JSON.stringify({
       model: 'deepseek-chat',
       messages,
-      temperature: 0.12,
+      temperature: 0.1,
       stream: false,
       response_format: { type: 'json_object' },
     }),
@@ -575,68 +623,23 @@ async function callModel(apiKey, messages) {
         /* fall */
       }
     }
-    return { action: 'done', message: content || 'No action' };
+    return {
+      action: 'submit',
+      command: 'uptime && df -h / | tail -1',
+      efficiency: {
+        goal: 'recover from bad JSON',
+        best_tool: 'uptime',
+        approach: 'basic probe',
+        tools: ['uptime', 'df'],
+        steps: ['probe'],
+        parallel: false,
+        install: null,
+        progressive_hex: false,
+        risk: 'green',
+        why: 'parse fallback',
+      },
+    };
   }
-}
-
-function systemPrompt() {
-  return `You are Gengar — system-wide terminal AUTOPILOT (gex).
-
-You handle ANY task. Never assume a scenario. Use TASK + SURVEY + TOOLKIT + PLAYBOOK + MEMORY + SCREEN only.
-
-## Core principle: best tool for the job
-Prefer the right tool over clever abuse of a worse one.
-Examples of the *principle* (not a checklist to hardcode):
-- directory tree → install/use tree (not ls -R)
-- fuzzy find → fzf/fd if available or install
-- JSON → jq
-- HTTP load → the right benchmark tool if needed
-If the best tool is missing and SURVEY.can_install allows it, action=install FIRST, then use it.
-Record installs in toolkit so next time PATH already has it.
-
-## Efficiency card (required before heavy work)
-{
-  "goal": "success criteria",
-  "approach": "strategy",
-  "best_tool": "primary binary",
-  "tools": ["..."],
-  "steps": ["..."],
-  "parallel": false,
-  "concurrency": 2,
-  "install": null or { "bin": "tree", "cmd": "brew install tree", "why": "best UX for trees" },
-  "progressive_hex": false,
-  "risk": "green|amber|red",
-  "why": "why this is most efficient"
-}
-Or efficiency_accept:true to accept seeded playbook.
-
-Self-ask every task:
-1) What is the actual success condition?
-2) What is the best tool GIVEN path_bins / can_install?
-3) Should I install a better tool?
-4) Best flags/params?
-5) Chain vs parallel fan-out?
-6) Progressive updates for long work?
-
-## Actions (JSON only)
-- install — equip a better tool (command or bin+auto brew/cargo/npm/uv/go)
-- submit — run one foreground command; host waits until NEW prompt
-- parallel — {jobs:[{id,cmd}] or commands:[...], concurrency?} any independent units
-- progress_hex — mid-flight user update
-- type | key | wait — interaction
-- memory_search — dig room memory
-- done — final HEX
-
-Interactive y/n, menus, "type DELETE" answered by a FAST side AI on the byte stream.
-
-## Rules
-- SURVEY.path_bins is ground truth for what exists.
-- Install only when ROI is real (better tool / clearer output / big time win).
-- Prefer parallel when work units are independent.
-- No sudo/rm -rf //force-push/curl|sh unless user demanded.
-- Password → don't invent; ask user / done.
-- After success, done with a clear summary.
-`;
 }
 
 function clip(s, n) {

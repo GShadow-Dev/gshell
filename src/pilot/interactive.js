@@ -1,4 +1,5 @@
 import { sleep } from '../keys.js';
+import { snapSystem, snapUser } from '../prompts.js';
 
 const API = 'https://api.deepseek.com/chat/completions';
 
