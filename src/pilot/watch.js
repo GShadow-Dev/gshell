@@ -28,6 +28,10 @@ export function rewriteCommand(cmd, task) {
     c = c.replace(/\s-O\b/g, ' ');
     if (!/\s-sV\b/.test(c)) c = c.replace(/\bnmap\b/, 'nmap -sV');
   }
+  // Keep long nmap jobs chatty so humans + heartbeat have signal
+  if (/\bnmap\b/i.test(c) && !/--stats-every/.test(c)) {
+    c = c.replace(/\bnmap\b/, 'nmap --stats-every 5s');
+  }
   return c;
 }
 

@@ -190,8 +190,7 @@ export async function runAgent({
 
 /**
  * Wait until the shell shows a prompt that appears AFTER mark.
- * Progress/output can keep flowing for minutes (nmap, brew) — we do not
- * burn Mind steps; we just watch. AI snap-decides only if a prompt appears.
+ * Heartbeat on the Gengar bar so long quiet jobs never look frozen.
  */
 async function watchUntilPrompt(
   session,
@@ -202,6 +201,8 @@ async function watchUntilPrompt(
   let lastLen = session.buffer.length;
   let lastGrowth = Date.now();
   let lastBeat = 0;
+  let lastTickLine = 0;
+  let peakLen = lastLen;
 
   while (Date.now() - start < timeoutMs) {
     if (steerQueue?.length) return { reason: 'steer', exitHint: null };
@@ -211,11 +212,10 @@ async function watchUntilPrompt(
     if (len !== lastLen) {
       lastLen = len;
       lastGrowth = Date.now();
+      if (len > peakLen) peakLen = len;
     }
 
-    // Done only when we have NEW content past mark AND a prompt
     if (promptAfterMark(session, mark)) {
-      // Require a brief quiet so we don't cut mid-line
       const quietFor = Date.now() - lastGrowth;
       if (quietFor >= 450) {
         return {
@@ -225,23 +225,62 @@ async function watchUntilPrompt(
       }
     }
 
-    if (Date.now() - lastBeat > 2000) {
-      const s = Math.round((Date.now() - start) / 1000);
-      const flowing = Date.now() - lastGrowth < 1500;
+    const now = Date.now();
+    if (now - lastBeat > 900) {
+      const s = Math.round((now - start) / 1000);
+      const silent = Math.round((now - lastGrowth) / 1000);
+      const flowing = now - lastGrowth < 1500;
+      const snap = lastOutputHint(session, mark);
       const tag = auto.cancelled
         ? 'cancelling'
         : flowing
-          ? 'running'
-          : auto.answeredConfirm
-            ? 'running'
+          ? 'live'
+          : silent >= 8
+            ? `silent ${silent}s`
             : 'waiting';
-      gengar?.setState('watching', `${tag} ${s}s`);
-      lastBeat = Date.now();
+      // Compact: live 42s · hosts up · silent 3s
+      const detail = snap
+        ? `${tag} ${s}s · ${snap}`
+        : `${tag} ${s}s`;
+      gengar?.setState('watching', clip(detail, 48));
+      lastBeat = now;
+    }
+
+    // Every 15s of silence, pulse a stronger cast flash so human knows we're alive
+    if (now - lastGrowth >= 15000 && now - lastTickLine >= 15000) {
+      gengar?.act(`still watching ${Math.round((now - start) / 1000)}s`);
+      lastTickLine = now;
     }
 
     await sleep(100);
   }
   return { reason: 'timeout', exitHint: null };
+}
+
+/** Pull a short human hint from newest output after mark. */
+function lastOutputHint(session, mark) {
+  const delta = session.buffer.slice(mark);
+  const text = String(delta)
+    .replace(/\u001b\][\s\S]*?(?:\u0007|\u001b\\)/g, '')
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\r/g, '');
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !/^╰─/.test(l) && !/^gsh\//.test(l));
+  if (!lines.length) return '';
+  let last = lines[lines.length - 1];
+  // Prefer progress-ish lines if present in last few
+  for (const l of lines.slice(-6).reverse()) {
+    if (/(stats:|%|etc:|done|up |latency|report for|scanning|elapsed|hosts?)/i.test(l)) {
+      last = l;
+      break;
+    }
+  }
+  // compress noise
+  last = last.replace(/\s+/g, ' ');
+  if (last.length > 36) last = `${last.slice(0, 34)}…`;
+  return last;
 }
 
 function fmtAuto(auto) {
