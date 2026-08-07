@@ -178,10 +178,14 @@ function parseArgs(argv) {
   const opts = { _: [], help: false, maxSteps: 28 };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === '--') {
+      // rest is literal task tokens
+      opts._.push(...argv.slice(i + 1));
+      break;
+    }
     if (a === '-h' || a === '--help') opts.help = true;
     else if (a === '--max-steps') opts.maxSteps = Number(argv[++i]) || 28;
     else if (a === 'recall' || a === 'log') {
-      // handled lightly
       opts.help = false;
       opts._.push(a);
     } else if (a.startsWith('-')) {
