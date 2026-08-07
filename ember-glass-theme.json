@@ -1,0 +1,57 @@
+{
+  "name": "Ember Glass",
+  "version": "1.0.0",
+  "description": "gShell native terminal theme. Consumed by gsh and all gShell surfaces.",
+  "palette": {
+    "foreground": {
+      "primary": "#f4f1eb",
+      "secondary": "#d8cff0",
+      "muted": "#5f6873"
+    },
+    "background": {
+      "canvas": "#05030a",
+      "surface": "#0d0814",
+      "raised": "#181022",
+      "bruise": "#12071f"
+    },
+    "accent": {
+      "ember": "#ff7a18",
+      "violet": "#c792ea",
+      "teal": "#59d0d8",
+      "amber": "#ffb454",
+      "cyan_option": "#7bbce3",
+      "red_error": "#ff5d45",
+      "green_success": "#91c483"
+    },
+    "border": "#302240",
+    "selection": {
+      "text": "#f4f1eb",
+      "background": "#343a40"
+    }
+  },
+  "semantic_tokens": {
+    "command": { "color": "#59d0d8", "bold": true },
+    "keyword": { "color": "#c792ea" },
+    "quote": { "color": "#ffb454" },
+    "redirect": { "color": "#ff7a18" },
+    "error": { "color": "#ff5d45", "bold": true },
+    "param": { "color": "#f4f1eb" },
+    "option": { "color": "#7bbce3" },
+    "comment": { "color": "#5f6873", "italics": true },
+    "operator": { "color": "#ff7a18" },
+    "escape": { "color": "#59d0d8" },
+    "autosuggestion": { "color": "#5f6873" }
+  },
+  "persona": {
+    "name": "Gengar",
+    "sprite": "~/.config/fish/assets/fire-gengar.png",
+    "voice": "Watchful, mischievous, direct. Answers with evidence. Lead with the finding.",
+    "signature": "Green dashboards lie. I check the bodies."
+  },
+  "gshadow_bridge": {
+    "primary_violet": "#7c3aed",
+    "lavender": "#a78bfa",
+    "brand_surface": "#0d0814",
+    "brand_canvas": "#05030a"
+  }
+}
