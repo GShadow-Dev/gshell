@@ -1,24 +1,8 @@
 const LONG_JOB_RE =
-  /\b(brew\s+upgrade|brew\s+install|npm\s+i(?:nstall)?|pnpm\s+i(?:nstall)?|yarn\s+add|cargo\s+build|cargo\s+install|docker\s+pull|docker\s+compose|mise\s+install|pip\s+install|npx\s+create-|create-next-app)\b/i;
-
-const CONFIRM_RE =
-  /(do you want to proceed|\[y\/n\]|\[Y\/n\]|\(y\/N\)|\(yes\/no\)|continue\?|overwrite\?|are you sure)/i;
-
-const PASSWORD_RE = /(password:|passphrase:|sudo password)/i;
+  /\b(brew\s+upgrade|brew\s+install|npm\s+i(?:nstall)?|pnpm\s+i(?:nstall)?|yarn\s+(add|install)|cargo\s+build|cargo\s+install|docker\s+pull|docker\s+compose|mise\s+install|pip\s+install|npx\s+|create-next-app|npm\s+create)\b/i;
 
 export function isLongJob(cmd) {
   return LONG_JOB_RE.test(String(cmd || ''));
-}
-
-export function detectPrompt(screenText) {
-  const t = String(screenText || '');
-  const tail = t.slice(-800);
-  if (PASSWORD_RE.test(tail)) return { type: 'password', tier: 'red' };
-  if (CONFIRM_RE.test(tail)) {
-    // brew upgrade after explicit update task → green-ish amber
-    return { type: 'confirm_yn', tier: 'green' };
-  }
-  return null;
 }
 
 export function riskForCommand(cmd) {
@@ -32,13 +16,29 @@ export function riskForCommand(cmd) {
   return 'green';
 }
 
-/** Prefer noninteractive brew when task is clearly an upgrade. */
+/** Prefer noninteractive flags when we can. */
 export function rewriteCommand(cmd, task) {
-  let c = String(cmd || '');
+  let c = String(cmd || '').trim();
+  const t = String(task || '');
+
   if (/\bbrew\s+upgrade\b/i.test(c) && !/HOMEBREW_NO_ENV_HINTS/.test(c)) {
     c = `env HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_ANALYTICS=1 ${c}`;
   }
-  // If task says update/upgrade and brew asks nothing else
-  void task;
+
+  // npx create-next-app: force --yes on npx and full flags if bare
+  if (/\bnpx\s+/.test(c) && !/\bnpx\s+--yes\b/.test(c) && !/\bnpx\s+-y\b/.test(c)) {
+    c = c.replace(/\bnpx\b/, 'npx --yes');
+  }
+
+  // If they said create-next-app without flags, leave mind's command but ensure yes
+  if (/create-next-app/i.test(c) && !/--ts|--js/.test(c)) {
+    // mind should add flags; don't hard-rewrite path/name
+  }
+
+  // Cancel tasks: still launch, interactive layer handles SIGINT
+  void t;
   return c;
 }
+
+// re-export classify for agent convenience
+export { classifyTail } from './interactive.js';

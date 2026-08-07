@@ -1,5 +1,6 @@
 import { sleep } from './keys.js';
-import { isLongJob, detectPrompt, rewriteCommand } from './pilot/watch.js';
+import { isLongJob, rewriteCommand } from './pilot/watch.js';
+import { InteractiveAutopilot } from './pilot/interactive.js';
 import { searchBlobs } from './memory/retrieve.js';
 
 const API = 'https://api.deepseek.com/chat/completions';
@@ -24,6 +25,10 @@ export async function runAgent({
 
   track('session_start', { actor: 'gex', task, cwd: process.cwd() });
 
+  // Reactive layer: answers y/n and mid-install cancel without LLM latency
+  const auto = new InteractiveAutopilot(session, { gengar, track, task });
+  auto.start();
+
   const messages = [
     { role: 'system', content: systemPrompt(task, memoryPack) },
     {
@@ -32,91 +37,106 @@ export async function runAgent({
     },
   ];
 
-  for (let step = 1; step <= maxSteps; step++) {
-    drainSteers(steerQueue, messages, session, track, gengar);
+  try {
+    for (let step = 1; step <= maxSteps; step++) {
+      drainSteers(steerQueue, messages, session, track, gengar);
 
-    gengar?.setState('thinking', `${step}/${maxSteps}`);
-    onStatus?.(`step ${step}/${maxSteps}`);
+      gengar?.setState('thinking', `${step}/${maxSteps}`);
+      onStatus?.(`step ${step}/${maxSteps}`);
 
-    const action = await callModel(apiKey, messages);
-    messages.push({ role: 'assistant', content: JSON.stringify(action) });
-    track('gex_act', { actor: 'gex', action: action.action, cmd: action.command || action.text || '' });
-
-    const kind = action.action || 'done';
-
-    if (kind === 'done' || kind === 'reply') {
-      const msg = action.message || action.reason || 'Done.';
-      track('gex_reply', { actor: 'gex', text: msg });
-      gengar?.setState('speaking', 'hex');
-      return { ok: true, message: msg, steps: step, sessionEvents };
-    }
-
-    if (kind === 'memory_search') {
-      const q = action.query || action.text || task;
-      gengar?.setState('thinking', 'recall');
-      const hits = searchBlobs(ledger, q, 4);
-      const blobBits = hits
-        .map((h) => `ref=${h.ref}\n${h.lines.join('\n')}`)
-        .join('\n---\n');
-      messages.push({
-        role: 'user',
-        content: `MEMORY_RESULT q=${q}\n${blobBits || '(no blob hits)'}\n--- SCREEN ---\n${session.screenText()}`,
+      const action = await callModel(apiKey, messages);
+      messages.push({ role: 'assistant', content: JSON.stringify(action) });
+      track('gex_act', {
+        actor: 'gex',
+        action: action.action,
+        cmd: action.command || action.text || '',
       });
-      continue;
-    }
 
-    if (kind === 'wait') {
-      const ms = clamp(+action.ms || 700, 100, 20_000);
-      gengar?.setState('watching', `${ms}ms`);
-      await session.waitFor({ quietMs: ms, timeoutMs: ms + 400 });
-      pushScreen(messages, session, `wait ${ms}ms`);
-      continue;
-    }
+      const kind = action.action || 'done';
 
-    if (kind === 'key') {
-      const keys = action.keys || (action.key ? [action.key] : []);
-      gengar?.act(keys.join(' '));
-      for (const k of keys) {
-        await session.key(k);
-        await sleep(35);
+      if (kind === 'done' || kind === 'reply') {
+        const msg = action.message || action.reason || 'Done.';
+        track('gex_reply', { actor: 'gex', text: msg });
+        gengar?.setState('speaking', 'hex');
+        return { ok: true, message: msg, steps: step, sessionEvents, autoLog: auto.log };
       }
-      // Confirm keys are first-class for sprite
-      if (keys.some((k) => /^(y|n|enter)$/i.test(k)) || keys.includes('y') || action.text === 'y') {
-        track('confirm', { actor: 'gex', text: keys.join(' ') });
+
+      if (kind === 'memory_search') {
+        const q = action.query || action.text || task;
+        gengar?.setState('thinking', 'recall');
+        const hits = searchBlobs(ledger, q, 4);
+        const blobBits = hits
+          .map((h) => `ref=${h.ref}\n${h.lines.join('\n')}`)
+          .join('\n---\n');
+        messages.push({
+          role: 'user',
+          content: `MEMORY_RESULT q=${q}\n${blobBits || '(no blob hits)'}\n--- SCREEN ---\n${session.screenText()}`,
+        });
+        continue;
       }
-      await session.waitFor({ quietMs: 300, timeoutMs: 15_000 });
-      // Auto-handle if still on confirm? let next loop see screen
-      pushScreen(messages, session, `key ${keys.join(',')}`);
-      continue;
-    }
 
-    if (kind === 'type') {
-      const text = String(action.text ?? '');
-      gengar?.act(clip(text, 24));
-      await session.type(text, { delayMs: +action.delay_ms || 0 });
-      if (/^y(es)?$/i.test(text.trim()) || /^n(o)?$/i.test(text.trim())) {
-        track('confirm', { actor: 'gex', text: text.trim() });
+      if (kind === 'wait') {
+        const ms = clamp(+action.ms || 700, 100, 20_000);
+        gengar?.setState('watching', `${ms}ms`);
+        await session.waitFor({ quietMs: ms, timeoutMs: ms + 400 });
+        // Include auto log so mind knows y/ctrl-c already happened
+        pushScreen(messages, session, `wait ${ms}ms auto=${fmtAuto(auto)}`);
+        continue;
       }
-      await session.waitFor({ quietMs: 250, timeoutMs: 10_000 });
-      pushScreen(messages, session, 'type');
-      continue;
-    }
 
-    if (kind === 'submit') {
-      let line = rewriteCommand(action.command || action.text || '', task);
-      gengar?.act(clip(line, 40));
-      track('cmd_start', { actor: 'gex', cmd: line });
-      const t0 = Date.now();
-      await session.submit(line);
+      if (kind === 'key') {
+        const keys = action.keys || (action.key ? [action.key] : []);
+        // Skip redundant y if autopilot already answered
+        if (
+          auto.answeredConfirm &&
+          keys.length === 1 &&
+          /^(y|enter)$/i.test(keys[0])
+        ) {
+          pushScreen(messages, session, 'key skipped — autopilot already confirmed');
+          continue;
+        }
+        gengar?.act(keys.join(' '));
+        for (const k of keys) {
+          await session.key(k);
+          await sleep(35);
+        }
+        await session.waitFor({ quietMs: 300, timeoutMs: 15_000 });
+        pushScreen(messages, session, `key ${keys.join(',')} auto=${fmtAuto(auto)}`);
+        continue;
+      }
 
-      if (isLongJob(line) || action.watch) {
-        // Watch mode: don't burn LLM turns; wait for settle / confirm / exit
-        const result = await watchJob(session, {
+      if (kind === 'type') {
+        const text = String(action.text ?? '');
+        if (auto.answeredConfirm && /^y(es)?$/i.test(text.trim())) {
+          pushScreen(messages, session, 'type skipped — autopilot already confirmed');
+          continue;
+        }
+        gengar?.act(clip(text, 24));
+        await session.type(text, { delayMs: +action.delay_ms || 0 });
+        await session.waitFor({ quietMs: 250, timeoutMs: 10_000 });
+        pushScreen(messages, session, `type auto=${fmtAuto(auto)}`);
+        continue;
+      }
+
+      if (kind === 'submit') {
+        const line = rewriteCommand(action.command || action.text || '', task);
+        // Reset per-command autopilot flags for confirm; keep cancelIntent
+        auto.answeredConfirm = false;
+        // cancel only once per task unless mind resets
+        gengar?.act(clip(line, 40));
+        track('cmd_start', { actor: 'gex', cmd: line });
+        const t0 = Date.now();
+        await session.submit(line);
+
+        const useWatch = isLongJob(line) || action.watch || auto.cancelIntent;
+        const result = await watchUntilDone(session, {
           gengar,
           steerQueue,
-          track,
-          timeoutMs: +action.timeout_ms || 600_000,
+          auto,
+          timeoutMs: +action.timeout_ms || (useWatch ? 600_000 : 180_000),
+          quietMs: useWatch ? 1800 : (+action.quiet_ms || 500),
         });
+
         const out = session.screenText(14000);
         const ref = ledger?.putBlob(out, 'cmd');
         track('cmd_end', {
@@ -125,96 +145,80 @@ export async function runAgent({
           exit: result.exitHint,
           duration_ms: Date.now() - t0,
           blob_ref: ref,
-          tags: ['long_job'],
+          tags: useWatch ? ['long_job'] : [],
+          auto: fmtAuto(auto),
         });
         messages.push({
           role: 'user',
-          content: `TOOL_RESULT submit+watch reason=${result.reason}\n$ ${line}\n--- SCREEN ---\n${out}\n--- END ---`,
+          content: `TOOL_RESULT submit reason=${result.reason} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}\n--- END ---`,
         });
-      } else {
-        const w = await session.waitFor({
-          quietMs: +action.quiet_ms || 550,
-          timeoutMs: +action.timeout_ms || 180_000,
-        });
-        // Auto-confirm green y/n if brew-style prompt appears mid-command
-        const prompt = detectPrompt(session.screenText());
-        if (prompt?.type === 'confirm_yn' && prompt.tier === 'green') {
-          gengar?.act('y');
-          track('confirm', { actor: 'gex', text: 'y', auto: true });
-          await session.type('y');
-          await session.key('enter');
-          await session.waitFor({ quietMs: 800, timeoutMs: 600_000 });
+
+        // If task wanted cancel+cleanup and we cancelled, nudge mind to rm
+        if (auto.cancelled && auto.cleanupIntent) {
+          messages.push({
+            role: 'user',
+            content:
+              'NOTE: Autopilot already sent ctrl-c mid-install. If leftover project dirs exist from this task, submit rm -rf on them, then done.',
+          });
         }
-        const out = session.screenText(12000);
-        const ref = ledger?.putBlob(out, 'cmd');
-        track('cmd_end', {
-          actor: 'gex',
-          cmd: line,
-          duration_ms: Date.now() - t0,
-          blob_ref: ref,
-        });
-        messages.push({
-          role: 'user',
-          content: `TOOL_RESULT submit wait=${w.reason}\n$ ${line}\n--- SCREEN ---\n${out}\n--- END ---`,
-        });
+        continue;
       }
-      continue;
+
+      pushScreen(messages, session, `unknown action ${kind}`);
     }
 
-    pushScreen(messages, session, `unknown action ${kind}`);
+    return {
+      ok: false,
+      message: 'Step limit reached.',
+      steps: maxSteps,
+      sessionEvents,
+      autoLog: auto.log,
+    };
+  } finally {
+    auto.stop();
   }
-
-  return {
-    ok: false,
-    message: 'Step limit reached.',
-    steps: maxSteps,
-    sessionEvents,
-  };
 }
 
-async function watchJob(session, { gengar, steerQueue, track, timeoutMs }) {
-  gengar?.setState('watching', 'long job');
+async function watchUntilDone(session, { gengar, steerQueue, auto, timeoutMs, quietMs }) {
+  gengar?.setState('watching', auto.cancelIntent ? 'watch+cancel' : 'long job');
   const start = Date.now();
-  let lastSteer = 0;
+  let lastBeat = 0;
 
   while (Date.now() - start < timeoutMs) {
-    // User steer aborts watch early for mind
-    if (steerQueue?.length) {
-      return { reason: 'steer', exitHint: null };
-    }
-    const screen = session.screenText();
-    const prompt = detectPrompt(screen);
-    if (prompt?.type === 'password') {
-      gengar?.setState('needs_you', 'password');
-      track('caveat', { text: 'password prompt — needs user' });
-      return { reason: 'password', exitHint: null };
-    }
-    if (prompt?.type === 'confirm_yn') {
-      gengar?.act('y');
-      track('confirm', { actor: 'gex', text: 'y', auto: true });
-      await session.type('y');
-      await session.key('enter');
-      await sleep(400);
-      gengar?.setState('watching', 'long job');
-      continue;
-    }
-    // Quiet prompt-ish end: two quiet seconds after output
-    const quiet = await session.waitFor({ quietMs: 2000, timeoutMs: 2500 });
+    if (steerQueue?.length) return { reason: 'steer', exitHint: null };
+
+    // Autopilot may have cancelled — wait for prompt after SIGINT
+    const quiet = await session.waitFor({ quietMs, timeoutMs: quietMs + 800 });
     if (quiet.ok && quiet.reason === 'quiet') {
-      // Heuristic: look like shell prompt returned
-      const tail = session.screenText(400);
-      if (/[❯❯╰─>$%#]\s*$/m.test(tail) || /gsh\/\d+/.test(tail)) {
-        return { reason: 'prompt', exitHint: 0 };
+      const tail = session.screenText(500);
+      if (isShellPrompt(tail) || session.exited) {
+        return { reason: auto.cancelled ? 'cancelled' : 'prompt', exitHint: auto.cancelled ? 130 : 0 };
+      }
+      // quiet but not prompt — keep watching if long install without cancel done
+      if (!auto.cancelIntent) {
+        // still running silently?
+        if (Date.now() - start > 5000 && isShellPrompt(tail)) {
+          return { reason: 'prompt', exitHint: 0 };
+        }
       }
     }
-    // heartbeat sprite
-    if (Date.now() - lastSteer > 3000) {
-      gengar?.setState('watching', `t=${Math.round((Date.now() - start) / 1000)}s`);
-      lastSteer = Date.now();
+
+    if (Date.now() - lastBeat > 2000) {
+      const tag = auto.cancelled ? 'cancelling' : auto.answeredConfirm ? 'running' : 'waiting';
+      gengar?.setState('watching', `${tag} ${Math.round((Date.now() - start) / 1000)}s`);
+      lastBeat = Date.now();
     }
-    await sleep(200);
+    await sleep(80);
   }
   return { reason: 'timeout', exitHint: null };
+}
+
+function isShellPrompt(tail) {
+  return /[❯╰─>$%#]\s*$/m.test(tail) || /gsh\/\d+/.test(tail) || /fish\s*$/m.test(tail);
+}
+
+function fmtAuto(auto) {
+  return `y=${auto.answeredConfirm ? 1 : 0},cxl=${auto.cancelled ? 1 : 0}`;
 }
 
 function drainSteers(q, messages, session, track, gengar) {
@@ -271,8 +275,10 @@ async function callModel(apiKey, messages) {
 function systemPrompt(task, memoryPack) {
   return `You are Gengar — terminal AUTOPILOT (gex) in Ghostty.
 
-You drive a LIVE fish shell. Human watches real TTY. Sprite is bottom status (not scrollback).
-Human typing steers you (Enter). You pick settings. No handoff. No wizards when you can pass flags.
+You drive a LIVE fish shell. A FAST reactive layer already answers:
+- "Ok to proceed? (y)" / [y/n] → sends y immediately (you will see it on SCREEN)
+- If TASK asks to cancel mid-install → sends ctrl-c once install progress appears
+Do NOT wait multi-step to press y. Prefer submit once, then observe auto=y=1,cxl=1 in TOOL_RESULT.
 
 ## JSON every turn (no fences)
 {
@@ -282,35 +288,30 @@ Human typing steers you (Enter). You pick settings. No handoff. No wizards when 
   "command": "full line for submit",
   "text": "type chars",
   "key": "enter",
-  "keys": ["y"] ,
+  "keys": ["y"],
   "query": "for memory_search",
   "watch": true,
-  "ms": 800,
-  "quiet_ms": 600,
   "timeout_ms": 120000
 }
 
 ## Actions
-- submit: type command + Enter. Set watch=true for brew/npm/cargo/docker long jobs.
-- type / key: drive prompts. For [y/n] prefer type "y" or keys. Host may auto-y green confirms.
-- wait: short settle
-- memory_search: pull searchable room memory (use when task refers to past work)
-- done: finish — message is the HEX result the human reads
+- submit: one command + Enter. Use full create-next-app flags. Host watches + auto y/cancel.
+- type/key: only if reactive layer did not handle a prompt (password → done asking user).
+- memory_search: dig room memory
+- done: HEX result for the human
+
+## Cancel+cleanup tasks
+If TASK says cancel during install and delete files:
+1. submit create-next-app (with flags) once
+2. Host auto y + ctrl-c
+3. On TOOL_RESULT with cxl=1, submit rm -rf <dir>
+4. done
 
 ## Memory
-You receive a MEMORY pack at start (summaries, recent cmds, hits). It is incomplete by design.
-Use memory_search to dig. Do not assume absence of evidence is evidence of absence without search.
-
-## Pilot rules
-1. Read SCREEN. Drive interactive UI with keys.
-2. Prefer fully flagged noninteractive launches (create-next-app --ts --tailwind ...).
-3. Long installers: one submit with watch=true, then done from SCREEN.
-4. STEER overrides plan immediately.
-5. Info tasks: submit real command, done with findings (not "run this yourself").
-6. One atomic action per turn.
+MEMORY pack is incomplete by design. Use memory_search when needed.
 
 ## Safety
-No sudo/rm -rf //force push/curl|sh unless user demanded. Password → done asking user to run manually.
+No sudo/rm -rf / / force-push/curl|sh unless demanded. Password → needs user.
 
 Task: ${task}
 `;
@@ -322,5 +323,5 @@ function clamp(n, a, b) {
 
 function clip(s, n) {
   s = String(s || '');
-  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }

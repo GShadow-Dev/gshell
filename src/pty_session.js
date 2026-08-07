@@ -78,8 +78,14 @@ export class PtySession {
     this.exited = false;
     this.exitCode = null;
     this._filter = null;
+    this._outputListeners = new Set();
   }
 
+  /** Subscribe to displayable output chunks. Returns unsubscribe. */
+  onOutput(fn) {
+    this._outputListeners.add(fn);
+    return () => this._outputListeners.delete(fn);
+  }
   start() {
     if (!process.stdout.isTTY) {
       throw new Error('gex needs a real Ghostty TTY');
@@ -114,6 +120,13 @@ export class PtySession {
         this.buffer = this.buffer.slice(-this.maxBuffer);
       }
       if (display) process.stdout.write(display);
+      for (const fn of this._outputListeners) {
+        try {
+          fn(display, this.buffer);
+        } catch {
+          /* ignore listener errors */
+        }
+      }
     });
 
     this.term.onExit(({ exitCode }) => {
