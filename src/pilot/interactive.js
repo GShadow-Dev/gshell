@@ -172,28 +172,8 @@ export async function fastDecide({ apiKey, task, kind, promptTail }) {
     return fallbackDecide(kind, promptTail, task);
   }
 
-  const system = `You answer ONE interactive terminal prompt. Reply with ONLY the exact characters to type (no quotes, no explanation, no newline words).
-Rules:
-- y/n questions: reply y or n (single letter unless prompt requires yes/no full word)
-- Numbered menus: reply the number only
-- "Type DELETE to confirm": reply DELETE (or the exact required token)
-- If the user task wants cancel/abort after starting, still answer proceed prompts with y so install can start
-- If the user task clearly wants to refuse/decline: n
-- If you cannot safely decide: NEED_USER
-- Never invent passwords. Password prompts: NEED_USER
-- Prefer the option that best completes the USER TASK.`;
-
-  const user = `USER TASK:
-${task}
-
-PROMPT KIND: ${kind}
-
-PROMPT (tail of terminal):
-"""
-${promptTail.slice(-900)}
-"""
-
-What exact characters should be typed right now?`;
+  const system = snapSystem();
+  const user = snapUser({ task, kind, promptTail });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3500);
