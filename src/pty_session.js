@@ -27,11 +27,21 @@ function ensureSpawnHelperExecutable() {
   }
 }
 
+/**
+ * gex is fish-native (binds, scribe, `history save`, autopilot env all assume
+ * fish). $SHELL is unreliable — macOS/terminal apps often leave it pointing at
+ * the account's login shell even when the user's actual interactive shell
+ * (and everything gex's fish/*.fish integrates with) is fish. So: fish wins
+ * whenever it's installed; $SHELL/zsh/bash are only a fallback for machines
+ * without fish. GEX_SHELL lets a user override explicitly.
+ */
 function resolveShell() {
   const candidates = [
-    process.env.SHELL,
+    process.env.GEX_SHELL,
     '/opt/homebrew/bin/fish',
     '/usr/local/bin/fish',
+    '/usr/bin/fish',
+    process.env.SHELL,
     '/bin/zsh',
     '/bin/bash',
   ].filter(Boolean);
@@ -179,15 +189,20 @@ export class PtySession {
   }
 
   /**
-   * Submit a shell command.
+   * Submit a shell command exactly as typed — no appended text. The user
+   * must see the identical thing they'd see typing it themselves.
+   *
    * Multi-line / heredoc → write a temp bash script and run it (fish interactive
-   * binds and quoting are hostile to bash-style heredocs typed live).
+   * binds and quoting are hostile to bash-style heredocs typed live). Returns
+   * { tmpPath } so the caller can delete it from Node once the run is over —
+   * chaining `; rm -f` onto the same line would make the shell's real exit
+   * status reflect `rm`, not the script, silently breaking fail detection.
    */
   async submit(line) {
     const s = String(line ?? '');
     if (!s.trim()) {
       await this.key('enter');
-      return;
+      return { tmpPath: '' };
     }
 
     const multiline =
@@ -202,15 +217,19 @@ export class PtySession {
       );
       const body = s.endsWith('\n') ? s : `${s}\n`;
       fs.writeFileSync(tmp, body, { mode: 0o700 });
-      // bash runs the script; always rm. Quote path for fish.
       const q = `'${tmp.replace(/'/g, `'\\''`)}'`;
-      await this.type(`bash ${q}; rm -f ${q}`);
+      // Show the real script before running it — a temp file is an
+      // implementation detail, but its contents must not be hidden from
+      // the user. `cat` first is a genuine, natural thing to type, not
+      // synthetic status text.
+      await this.type(`cat ${q}; bash ${q}`);
       await this.key('enter');
-      return;
+      return { tmpPath: tmp };
     }
 
     await this.type(s);
     await this.key('enter');
+    return { tmpPath: '' };
   }
 
   async waitFor({ pattern = null, quietMs = 500, timeoutMs = 60_000 } = {}) {
