@@ -2,16 +2,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { sleep } from './keys.js';
+import { stripAnsi } from './pty_session.js';
 import { rewriteCommand, promptAfterMark } from './pilot/watch.js';
 import { InteractiveAutopilot } from './pilot/interactive.js';
-import {
-  runParallel,
-  formatParallelBoard,
-  defaultConcurrency,
-} from './pilot/scheduler.js';
+import { formatParallelBoard } from './pilot/scheduler.js';
 import { searchBlobs } from './memory/retrieve.js';
 import { surveyMachine, formatSurvey } from './mind/survey.js';
 import { Toolkit } from './mind/toolkit.js';
+import { gsearch, formatGsearch, detectGsearch } from './mind/gsearch.js';
 import { SYSTEM, userBrief, REJECT } from './prompts.js';
 
 const API = 'https://api.deepseek.com/chat/completions';
@@ -37,8 +35,20 @@ export async function runAgent({
 
   const toolkit = new Toolkit();
   const survey = surveyMachine(process.cwd());
+  // $SHELL is unreliable (often stale login-shell metadata); report the
+  // shell actually driving this PTY so the model's quoting/syntax matches.
+  survey.shell = session.shell || survey.shell;
   const surveyText = formatSurvey(survey);
   const playbook = toolkit.matchPlaybook(task);
+
+  // Advertise GSearch only when a backend is actually reachable — the model
+  // must never be told it has a tool that will fail.
+  let gsAvail = { context7: false, firecrawl: false };
+  try {
+    gsAvail = await detectGsearch();
+  } catch {
+    /* offline — local discovery still works */
+  }
 
   track('session_start', { actor: 'gex', task, cwd: process.cwd() });
   track('survey', { actor: 'gex', text: surveyText.slice(0, 2500) });
@@ -58,6 +68,30 @@ export async function runAgent({
   const failMap = new Map();
   const tSession = Date.now();
   const progressNotes = [];
+  /**
+   * Loop health. `ok`/`fail` gate playbook recording (a failed session must
+   * never be saved as a winning recipe). `lastFailed` drives the forced
+   * diagnosis step so failure is re-diagnosed, not just reacted to.
+   */
+  const runState = {
+    ok: 0,
+    fail: 0,
+    lastFailed: false,
+    lastError: '',
+    diagnosisAsked: false,
+    verifyAsked: false,
+    discovered: 0,
+    discoverTried: false,
+    gsearchTried: false,
+    gsearchAsked: false,
+  };
+  /**
+   * Every batch ever issued, by signature. Re-running an IDENTICAL batch is a
+   * loop even when it prints plenty of output — a job that always succeeds
+   * (`system_profiler | head`) otherwise masks the fact that nothing is
+   * progressing. Repetition, not failure, is the signal here.
+   */
+  const issuedBatches = new Map();
 
   const messages = [
     { role: 'system', content: SYSTEM },
@@ -71,9 +105,13 @@ export async function runAgent({
         memoryPack,
         screen: session.screenText(),
         seededEfficiency: efficiency,
+        gsearch: gsAvail,
       }),
     },
   ];
+
+  let rejects = 0;
+  const MAX_REJECTS = 10;
 
   try {
     for (let step = 1; step <= maxSteps; step++) {
@@ -81,6 +119,7 @@ export async function runAgent({
       gengar?.setState('thinking', `${step}/${maxSteps}`);
       onStatus?.(`step ${step}/${maxSteps}`);
 
+      compactMessages(messages);
       const action = await callModel(apiKey, messages);
       messages.push({ role: 'assistant', content: JSON.stringify(action) });
 
@@ -110,9 +149,32 @@ export async function runAgent({
         ranCommands,
         message: action.message || action.reason || '',
         failMap,
+        action,
+        runState,
+        issuedBatches,
       });
       if (reject) {
+        rejects++;
+        track('reject', { actor: 'gex', text: reject.slice(0, 300) });
+        // Visible: a rejected turn costs wall-clock but shows nothing in the
+        // terminal, which reads as "gex froze". Say so, dimly, once per reject.
+        process.stderr.write(
+          `\x1b[38;2;95;104;115m  gex: retry — ${clip(firstLine(reject), 84)}\x1b[0m\n`,
+        );
         messages.push({ role: 'user', content: reject });
+        if (rejects >= MAX_REJECTS) {
+          return {
+            ok: false,
+            message: `Stopped: ${rejects} malformed/blocked turns in a row without productive work.`,
+            steps: step,
+            sessionEvents,
+            autoLog: auto.log,
+            efficiency,
+            commands: ranCommands,
+          };
+        }
+        // A rejected turn produced no work — don't spend the action budget on it.
+        step--;
         continue;
       }
 
@@ -126,13 +188,19 @@ export async function runAgent({
             : msg;
         track('gex_reply', { actor: 'gex', text: finalMsg });
         gengar?.setState('speaking', 'hex');
-        toolkit.recordWin({
-          task,
-          efficiency,
-          commands: ranCommands,
-          wall_ms: Date.now() - tSession,
-          ok: true,
-        });
+        // Only record a playbook when work actually succeeded. A session that
+        // ended in "I couldn't do it" must never be replayed as a winning
+        // recipe — that was poisoning future runs with the losing approach.
+        const reallyWon = runState.ok > 0 && runState.ok >= runState.fail;
+        if (reallyWon) {
+          toolkit.recordWin({
+            task,
+            efficiency,
+            commands: ranCommands,
+            wall_ms: Date.now() - tSession,
+            ok: true,
+          });
+        }
         return {
           ok: true,
           message: finalMsg,
@@ -176,6 +244,7 @@ export async function runAgent({
           tags: ['install'],
           binHint: action.bin || action.tool || efficiency?.install?.bin,
           purpose: action.why || efficiency?.install?.why || '',
+          runState,
         });
         continue;
       }
@@ -265,16 +334,124 @@ export async function runAgent({
         continue;
       }
 
+      // GSearch — off-machine evidence, same triangulation doctrine. Several
+      // DIFFERENT phrasings are issued concurrently and only identifiers that
+      // appear in 2+ independent sources are promoted as agreed. Results are
+      // tier-tagged so on-machine truth always outranks a scraped page.
+      if (kind === 'gsearch' || kind === 'lookup') {
+        const angles = []
+          .concat(action.angles || action.queries || action.query || [])
+          .map((a) => String(a || '').trim())
+          .filter(Boolean)
+          .slice(0, 5);
+        if (!angles.length) {
+          messages.push({ role: 'user', content: REJECT.gsearchEmpty });
+          continue;
+        }
+        runState.gsearchTried = true;
+        const gsig = `gsearch:${angles.slice().sort().join('|')}`.slice(0, 400);
+        if ((issuedBatches.get(gsig) || 0) >= 2) {
+          messages.push({ role: 'user', content: REJECT.repeatDiscover(2) });
+          continue;
+        }
+        issuedBatches.set(gsig, (issuedBatches.get(gsig) || 0) + 1);
+
+        const sites = []
+          .concat(action.sites || action.domains || [])
+          .map((x) => String(x || '').trim())
+          .filter(Boolean);
+        gengar?.setState('thinking', `gsearch ${angles.length} angles`);
+        // Network lookups are not terminal commands, but they must still be
+        // visible — the user has to see everything gex does.
+        process.stderr.write(
+          `\x1b[38;2;89;208;216m  gsearch:\x1b[0m ${clip(angles.join(' | '), 96)}\n`,
+        );
+        track('gsearch', { actor: 'gex', text: angles.join(' | ').slice(0, 500) });
+
+        let out;
+        try {
+          out = await gsearch({ angles, topic: action.topic || task, sites });
+        } catch (err) {
+          out = { available: {}, results: [], agreed: [], error: err.message };
+        }
+        const agreedN = out.agreed?.length || 0;
+        ledger?.putBlob(formatGsearch(out), 'gsearch');
+        messages.push({
+          role: 'user',
+          content: `TOOL_RESULT gsearch angles=${angles.length} agreed=${agreedN}\n${formatGsearch(out)}\n\n${REJECT.afterGsearch}`,
+        });
+        continue;
+      }
+
+      // Triangulated discovery: run several INDEPENDENT read-only probes at
+      // once and cross-check them. One probe failing (a missing wrapper like
+      // `sdef`) must not end discovery — a different angle usually still
+      // reaches the same ground truth. Probes never enter the fail-map, so
+      // exploring costs nothing against the "change approach" pressure.
+      if (kind === 'discover' || kind === 'probe') {
+        const probes = normalizeJobs(action.probes || action.jobs || action.commands || []);
+        if (!probes.length) {
+          messages.push({ role: 'user', content: REJECT.discoverEmpty });
+          continue;
+        }
+        runState.discoverTried = true;
+        const dsigKey = batchSignature(probes);
+        issuedBatches.set(dsigKey, (issuedBatches.get(dsigKey) || 0) + 1);
+        gengar?.setState('watching', `discover 0/${probes.length}`);
+        track('discover_start', {
+          actor: 'gex',
+          text: `${action.goal || ''} :: ${probes.map((p) => p.cmd).join(' || ')}`.slice(0, 1500),
+        });
+
+        const results = await runParallelInPty(session, probes, {
+          gengar,
+          steerQueue,
+          auto,
+          timeoutMs: +action.timeout_ms || 300_000,
+        });
+
+        for (const r of results) {
+          if (r.cmd?.trim()) ranCommands.push(r.cmd);
+          ledger?.putBlob(r.out || '', `d-${r.id}`);
+          track('cmd_end', {
+            actor: 'gex',
+            cmd: r.cmd,
+            exit: r.code,
+            tags: ['discover'],
+          });
+        }
+        const hits = results.filter((r) => r.code === 0 && String(r.out || '').trim());
+        runState.discovered += hits.length;
+        // A probe batch that surfaced nothing is a dead set of angles.
+        // Record it so repeating the same probes gets blocked.
+        const dsig = batchSignature(probes);
+        if (!hits.length) {
+          const prev = failMap.get(dsig) || { n: 0, err: '', bin: '' };
+          failMap.set(dsig, {
+            n: prev.n + 1,
+            err: 'all probes returned nothing — change the angles',
+            bin: '',
+          });
+        } else {
+          failMap.delete(dsig);
+        }
+        // Discovery output is evidence, not a result — a probe that returns
+        // nothing is a dead angle, not a failed task.
+        messages.push({
+          role: 'user',
+          content: `TOOL_RESULT discover goal=${clip(String(action.goal || ''), 120)} probes=${probes.length} withOutput=${hits.length}\n${formatParallelBoard(results)}\n\n${REJECT.afterDiscover}`,
+        });
+        continue;
+      }
+
       if (kind === 'parallel' || kind === 'fanout') {
         const jobs = normalizeJobs(action.jobs || action.commands || []);
         if (!jobs.length) {
           messages.push({ role: 'user', content: REJECT.parallelEmpty });
           continue;
         }
-        const conc =
-          +action.concurrency ||
-          +efficiency?.concurrency ||
-          defaultConcurrency(survey.cpus || 4);
+        const psigKey = batchSignature(jobs);
+        issuedBatches.set(psigKey, (issuedBatches.get(psigKey) || 0) + 1);
         gengar?.setState('watching', `swarm 0/${jobs.length}`);
         track('parallel_start', {
           actor: 'gex',
@@ -284,21 +461,17 @@ export async function runAgent({
             .slice(0, 1500),
         });
 
-        const results = await runParallel(jobs, {
-          concurrency: conc,
-          cwd: process.cwd(),
+        const t0p = Date.now();
+        const results = await runParallelInPty(session, jobs, {
+          gengar,
+          steerQueue,
+          auto,
           timeoutMs: +action.timeout_ms || 900_000,
-          onUpdate: (u) => {
-            if (u.total) {
-              gengar?.setState(
-                'watching',
-                `swarm ${u.done || 0}/${u.total} live=${u.live || 0}`,
-              );
-            }
-          },
         });
+        const wallMs = Date.now() - t0p;
 
         for (const r of results) {
+          r.ms = wallMs;
           if (r.cmd?.trim()) ranCommands.push(r.cmd);
           ledger?.putBlob(r.out || '', `p-${r.id}`);
           track('cmd_end', {
@@ -311,9 +484,33 @@ export async function runAgent({
         }
 
         const board = formatParallelBoard(results);
+        const useful = results.filter(
+          (r) => r.code === 0 && String(r.out || '').trim(),
+        );
+        const psig = batchSignature(jobs);
+        if (!useful.length) {
+          const prev = failMap.get(psig) || { n: 0, err: '', bin: '' };
+          failMap.set(psig, {
+            n: prev.n + 1,
+            err: 'batch produced no usable output',
+            bin: '',
+          });
+          runState.fail += 1;
+          runState.lastFailed = true;
+          runState.lastError = 'parallel batch produced no usable output';
+          runState.diagnosisAsked = false;
+        } else {
+          failMap.delete(psig);
+          runState.ok += 1;
+          runState.lastFailed = false;
+        }
         messages.push({
           role: 'user',
-          content: `TOOL_RESULT parallel conc=${conc}\n${board}\n--- SCREEN ---\n${session.screenText()}\n\n${REJECT.afterTool}`,
+          content: `TOOL_RESULT parallel jobs=${jobs.length} withOutput=${useful.length}\n${board}\n\n${
+            useful.length
+              ? REJECT.afterTool
+              : 'Every job returned empty. Do NOT repeat this same batch — the approach is wrong, not the timing. Change what you are looking for or how you look for it.'
+          }`,
         });
         continue;
       }
@@ -333,8 +530,13 @@ export async function runAgent({
           action.stdin,
           action.applescript,
         );
+        let scriptTmpPath = '';
+        let scriptBin = '';
         if (scriptBody) {
-          line = materializeScript(line || 'bash', scriptBody);
+          const materialized = materializeScript(line || 'bash', scriptBody);
+          line = materialized.line;
+          scriptTmpPath = materialized.tmpPath;
+          scriptBin = materialized.bin;
         }
         if (!line) {
           messages.push({ role: 'user', content: REJECT.emptySubmit });
@@ -355,6 +557,9 @@ export async function runAgent({
           messages,
           timeoutMs: +action.timeout_ms || 900_000,
           tags: [],
+          cleanupPath: scriptTmpPath,
+          binHint: scriptBin,
+          runState,
         });
         if (auto.cancelled && auto.cleanupIntent) {
           messages.push({ role: 'user', content: REJECT.afterCancel });
@@ -390,13 +595,37 @@ function gate({
   ranCommands,
   message,
   failMap,
+  action = {},
+  runState = null,
+  issuedBatches = null,
 }) {
   if (!kind || kind === 'plan') {
     return efficiencyLocked ? REJECT.planOnly : REJECT.needEfficiency;
   }
 
-  if (!efficiencyLocked && !hasEff && !['memory_search'].includes(kind)) {
+  if (
+    !efficiencyLocked &&
+    !hasEff &&
+    !['memory_search', 'discover', 'probe', 'gsearch', 'lookup'].includes(kind)
+  ) {
     return REJECT.needEfficiency;
+  }
+
+  // After a failure, force ONE real diagnosis before acting again. Asked at
+  // most once per failure so it can never spiral into a rejection loop.
+  // `discover` is exempt — going to look for ground truth IS the right move.
+  if (
+    runState?.lastFailed &&
+    !runState.diagnosisAsked &&
+    ['submit', 'install', 'parallel', 'fanout'].includes(kind)
+  ) {
+    const diag = String(
+      action.diagnosis || action.reflection || action.why_failed || '',
+    ).trim();
+    if (diag.length < 24) {
+      runState.diagnosisAsked = true;
+      return REJECT.needDiagnosis(runState.lastError);
+    }
   }
 
   if (kind === 'done' || kind === 'reply') {
@@ -407,6 +636,64 @@ function gate({
     if (!worked && !chatty) return REJECT.doneNoWork;
     if (worked && hollow) return REJECT.doneHollow;
     if (!worked && hollow) return REJECT.doneNoWork;
+
+    // Claiming the goal happened requires having OBSERVED it. Exit codes only
+    // prove a command ran — that is how a track played to the wrong device
+    // still got reported as success. Asked at most once so it cannot loop.
+    if (worked && runState && !runState.verifyAsked) {
+      const verificationEarly = String(
+        action.verification || action.verified || action.evidence || '',
+      ).trim();
+      const verification = String(
+        action.verification || action.verified || action.evidence || '',
+      ).trim();
+      // An INFERRED premise is not evidence. The model can run a real command
+      // on top of a guessed fact ("assembled in China, most likely") and the
+      // output looks verified while the answer is fabricated. Hedge words in
+      // a final answer mean a link in the chain was never checked.
+      const hedged =
+        /\b(most likely|probably|typically|generally|usually|presumably|assume[sd]?|assuming|i believe|should be|would be|commonly|in general|likely)\b/i.test(
+          msg,
+        );
+      if (hedged && verificationEarly.length < 20) {
+        runState.verifyAsked = true;
+        return REJECT.unverifiedPremise;
+      }
+
+      const claimsSuccess =
+        /\b(success|succeed|worked|complete[d]?|done|playing|now (?:playing|running|set|enabled)|configured|installed|created|fixed|resolved)\b/i.test(
+          msg,
+        ) && !/\b(fail|could not|couldn't|unable|not achieved|no luck)\b/i.test(msg);
+      if (claimsSuccess && verification.length < 20) {
+        runState.verifyAsked = true;
+        return REJECT.needVerification;
+      }
+    }
+  }
+
+  // Batch actions loop too. Without this, an identical fanout could repeat
+  // forever — the fail-map only ever watched single commands. Note this
+  // blocks on REPETITION, not on failure: a batch containing one
+  // always-succeeds job would otherwise look productive forever.
+  if (['parallel', 'fanout', 'discover', 'probe'].includes(kind)) {
+    const jobs = normalizeJobs(
+      action.probes || action.jobs || action.commands || [],
+    );
+    if (jobs.length) {
+      const bsig = batchSignature(jobs);
+      const seen = issuedBatches?.get(bsig) || 0;
+      if (seen >= 2) {
+        return ['discover', 'probe'].includes(kind)
+          ? REJECT.repeatDiscover(seen)
+          : REJECT.repeatBatch(seen);
+      }
+      const bf = failMap?.get(bsig);
+      if (bf && bf.n >= 2) {
+        return ['discover', 'probe'].includes(kind)
+          ? REJECT.repeatDiscover(bf.n)
+          : REJECT.repeatFail(`${jobs.length} jobs (same batch)`, bf.n, bf.err);
+      }
+    }
   }
 
   if (kind === 'submit' || kind === 'install') {
@@ -458,13 +745,15 @@ async function execLine({
   tags = [],
   binHint = '',
   purpose = '',
+  cleanupPath = '',
+  runState = null,
 }) {
   auto.answeredConfirm = false;
   gengar?.act(clip(line, 40));
   track('cmd_start', { actor: 'gex', cmd: line, tags });
   const t0 = Date.now();
   const mark = session.buffer.length;
-  await session.submit(line);
+  const submitResult = await session.submit(line);
   const result = await watchUntilPrompt(session, {
     mark,
     gengar,
@@ -472,15 +761,29 @@ async function execLine({
     auto,
     timeoutMs,
   });
-  const out = session.screenText(16000);
+  // Only THIS command's output — not the whole scrollback. Feeding the entire
+  // screen back every turn meant the model kept re-reading its own earlier
+  // failures, which is exactly the pattern that made it repeat them.
+  const out = deltaText(session, mark, 14000);
   const exitCode = inferExit(out, result.exitHint);
   const errTail = extractErrors(out);
   const sig = cmdSignature(line);
   const bin = normBin(binHint || guessBin(line));
 
+  // Delete any temp script file from Node directly — never as a chained
+  // shell `rm`, which would overwrite the real exit status we just read.
+  for (const p of [cleanupPath, submitResult?.tmpPath]) {
+    if (!p) continue;
+    try {
+      fs.unlinkSync(p);
+    } catch {
+      /* ignore */
+    }
+  }
+
   const failed =
     (exitCode != null && exitCode !== 0) ||
-    /syntax error|not found|execution error|failed|quitting!|usage:/i.test(
+    /syntax error|script error|not found|execution error|failed|quitting!|usage:/i.test(
       out.slice(-2000),
     );
 
@@ -491,8 +794,19 @@ async function execLine({
       err: errTail || prev.err || `exit ${exitCode ?? '?'}`,
       bin: bin || prev.bin || '',
     });
+    if (runState) {
+      runState.fail += 1;
+      runState.lastFailed = true;
+      runState.lastError = errTail || `exit ${exitCode ?? '?'}`;
+      runState.diagnosisAsked = false;
+    }
   } else {
     failMap?.delete(sig);
+    if (runState) {
+      runState.ok += 1;
+      runState.lastFailed = false;
+      runState.lastError = '';
+    }
   }
 
   ledger?.putBlob(out, tags.includes('install') ? 'install' : 'cmd');
@@ -518,13 +832,77 @@ async function execLine({
     }
   }
 
-  const failNote = failed
-    ? `\nFAIL #${failMap?.get(sig)?.n || 1} for this command shape (bin=${bin || '?'}). Do NOT retry the same approach. Change tool, flags, quoting, or use a heredoc script.`
-    : '';
+  // Escalation is COACHED here, not blocked by the gate: the advice lands in
+  // the tool result the model reads the instant it fails, and it widens the
+  // source each time the current one comes up dry. Generic to any domain.
+  let failNote = '';
+  if (failed) {
+    const n = failMap?.get(sig)?.n || 1;
+    const total = runState?.fail || n;
+    const head = `\nFAIL #${n} for this command shape (bin=${bin || '?'}). Do NOT retry it, and do NOT merely reword it.`;
+    if (total >= 3 && runState && !runState.gsearchTried) {
+      failNote = `${head}\nESCALATE NOW → action=gsearch. ${total} failures means the answer is not reachable from this machine's own files. Give 3+ different phrasings in "angles" plus the official docs domain in "sites". Note: correct NAMES are not correct USAGE — if the identifiers are right and it still fails, you need a WORKING EXAMPLE of the calling idiom, not another grep of the same schema.`;
+    } else if (total >= 2 && runState && !runState.discoverTried) {
+      failNote = `${head}\nESCALATE NOW → action=discover with several INDEPENDENT probes (the underlying definition/data file, --help/man, live introspection). Stop guessing at names; go read them.`;
+    } else {
+      failNote = `${head}\nDiagnose the root cause, then either fix the form or widen your source: action=discover for local ground truth, action=gsearch when the machine itself does not have the answer.`;
+    }
+  }
+
 
   messages.push({
     role: 'user',
-    content: `TOOL_RESULT ${tags.includes('install') ? 'install' : 'submit'} reason=${result.reason} exit=${exitCode ?? 'null'} ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- SCREEN ---\n${out}${failNote}\n\n${REJECT.afterTool}`,
+    content: `TOOL_RESULT ${tags.includes('install') ? 'install' : 'submit'} reason=${result.reason} exit=${exitCode ?? 'null'} ms=${Date.now() - t0} auto=${fmtAuto(auto)}\n$ ${line}\n--- OUTPUT (this command only) ---\n${out || '(no output)'}${failNote}\n\n${REJECT.afterTool}`,
+  });
+}
+
+/**
+ * Run jobs as real, visible fish background jobs — `begin;<cmd>;end > file &`
+ * per job, then `wait`. The user sees exactly what typing that themselves
+ * would show (including fish's own "Job N has ended" notices) — nothing
+ * hidden about the mechanism. Only each job's OWN stdout/stderr is
+ * redirected into a private temp file (same as a human piping to a
+ * logfile) so gex can report structured per-job results; the trailing
+ * exit-code echo lives inside that same redirect, never on screen.
+ */
+async function runParallelInPty(session, jobs, { gengar, steerQueue, auto, timeoutMs }) {
+  const stamp = Date.now();
+  const files = jobs.map((j, i) =>
+    path.join(os.tmpdir(), `gex-par-${process.pid}-${i}-${stamp}.out`),
+  );
+  const markerBase = `___GEX_EXIT_${process.pid}_${stamp}`;
+  const parts = jobs.map((j, i) => {
+    const q = `'${files[i].replace(/'/g, `'\\''`)}'`;
+    return `begin; ${j.cmd}; echo "${markerBase}_${i}:$status"; end > ${q} 2>&1 &`;
+  });
+  const line = `${parts.join(' ')} wait`;
+
+  const mark = session.buffer.length;
+  await session.submit(line);
+  const result = await watchUntilPrompt(session, {
+    mark,
+    gengar,
+    steerQueue,
+    auto,
+    timeoutMs,
+  });
+
+  return jobs.map((j, i) => {
+    let out = '';
+    try {
+      out = fs.readFileSync(files[i], 'utf8');
+    } catch {
+      /* job never wrote — steer/timeout before it finished */
+    }
+    try {
+      fs.unlinkSync(files[i]);
+    } catch {
+      /* ignore */
+    }
+    const m = out.match(new RegExp(`${markerBase}_${i}:(-?\\d+)\\s*$`));
+    const code = m ? Number(m[1]) : result.reason === 'timeout' ? 124 : 1;
+    const cleanOut = m ? out.slice(0, out.lastIndexOf(m[0])).replace(/\n$/, '') : out;
+    return { id: j.id, cmd: j.cmd, code, out: cleanOut, ms: 0 };
   });
 }
 
@@ -553,7 +931,20 @@ async function watchUntilPrompt(
   let lastTickLine = 0;
 
   while (Date.now() - start < timeoutMs) {
-    if (steerQueue?.length) return { reason: 'steer', exitHint: null };
+    // A steer arriving mid-command must be ACKNOWLEDGED immediately and
+    // loudly. Previously it silently aborted the watch while the command
+    // kept running, so the user saw no confirmation and assumed it was
+    // dropped — and the next command could be submitted into a busy PTY.
+    if (steerQueue?.length) {
+      process.stderr.write(
+        `\n\x1b[48;2;255;122;24m\x1b[38;2;12;8;20m STEER RECEIVED \x1b[0m \x1b[38;2;255;180;84m${clip(
+          steerQueue.map((x) => String(x)).join(' | '),
+          90,
+        )}\x1b[0m\n`,
+      );
+      gengar?.setState('awake', 'steer taken');
+      return { reason: 'steer', exitHint: null };
+    }
     if (session.exited) return { reason: 'exited', exitHint: session.exitCode };
 
     const len = session.buffer.length;
@@ -622,15 +1013,21 @@ function lastOutputHint(session, mark) {
 }
 
 function peekCmd(a) {
-  return (
+  const base =
     first(
       a.command,
       a.install_cmd,
       a.text,
       Array.isArray(a.commands) ? a.commands[0] : '',
       Array.isArray(a.jobs) ? a.jobs[0]?.cmd : '',
-    ) || ''
-  );
+    ) || '';
+  // Script-body submissions materialize to `cat '<tmp>'; <bin> '<tmp>'`
+  // before they run — mirror that shape here (any placeholder text
+  // collapses under cmdSignature's quote-folding) so the pre-run fail-map
+  // lookup lines up with what execLine actually records after materializing.
+  const scriptBody = first(a.script, a.body, a.stdin, a.applescript);
+  if (scriptBody && base) return `cat '…'; ${base} '…'`;
+  return base;
 }
 
 function first(...xs) {
@@ -648,6 +1045,14 @@ function guessBin(cmd) {
   if (!tok) return '';
   const i = Math.max(tok.lastIndexOf('/'), tok.lastIndexOf('\\'));
   return i >= 0 ? tok.slice(i + 1) : tok;
+}
+
+/** Stable signature for a batch of jobs, order-independent. */
+function batchSignature(jobs) {
+  return `batch:${(jobs || [])
+    .map((j) => cmdSignature(j.cmd))
+    .sort()
+    .join('|')}`.slice(0, 600);
 }
 
 /** Collapse string literals so tiny quote edits still match. */
@@ -675,7 +1080,7 @@ function extractErrors(out) {
     .slice(0, 400);
 }
 
-/** Prefer real shell exit from prompt markers (fish ✘ N). */
+/** Prefer real shell exit from the theme's own prompt marker (fish ✘ N). */
 function inferExit(out, hint) {
   const text = String(out || '');
   const m1 = text.match(/✘\s*(\d+)/);
@@ -772,13 +1177,60 @@ function clip(s, n) {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
-/** Write body to temp file; return `<runner> <file>; rm -f <file>`. General. */
+function firstLine(s) {
+  return String(s || '').split('\n')[0].trim();
+}
+
+/** Clean output produced by THIS command only (buffer since its mark). */
+function deltaText(session, mark, n = 14000) {
+  const text = stripAnsi(String(session.buffer.slice(mark)))
+    .split('\n')
+    .map((l) => l.replace(/\s+$/, ''))
+    .filter((l) => l.trim().length)
+    .join('\n')
+    .trim();
+  return text.length > n ? `…(trimmed)…\n${text.slice(-n)}` : text;
+}
+
+/**
+ * Keep the conversation focused. Old TOOL_RESULT bodies are the single
+ * biggest source of context noise — and re-reading stale failures is what
+ * made the model repeat them. Keep the newest few verbatim, reduce the rest
+ * to their header line.
+ */
+function compactMessages(messages, keepVerbatim = 3) {
+  const idxs = [];
+  for (let i = 2; i < messages.length; i++) {
+    const m = messages[i];
+    if (m.role === 'user' && /^TOOL_RESULT /.test(String(m.content || ''))) {
+      idxs.push(i);
+    }
+  }
+  for (const i of idxs.slice(0, Math.max(0, idxs.length - keepVerbatim))) {
+    const content = String(messages[i].content || '');
+    if (content.length <= 400) continue;
+    messages[i] = {
+      role: 'user',
+      content: `${firstLine(content)}\n(earlier output trimmed — superseded by newer results)`,
+    };
+  }
+}
+
+/**
+ * Write body to a temp file; return { line: "cat <file>; <runner> <file>", tmpPath }.
+ * `cat` first so the real script content is visible before it runs — a temp
+ * file is an implementation detail, its contents must not be hidden.
+ * No `; rm -f` chained onto the line — that would make the shell's real
+ * exit status reflect `rm`, not the script, silently defeating fail
+ * detection. Caller (execLine) deletes tmpPath from Node once the run is
+ * over, invisibly — the user's terminal only ever shows the real command.
+ */
 function materializeScript(runner, body) {
   let text = String(body || '');
   if (!text.includes('\n') && /\\n/.test(text)) {
     text = text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
   }
-  if (!text.trim()) return '';
+  if (!text.trim()) return { line: '', tmpPath: '', bin: '' };
   const base =
     String(runner || 'bash')
       .trim()
@@ -798,5 +1250,5 @@ function materializeScript(runner, body) {
   const tmp = path.join(os.tmpdir(), `gex-${process.pid}-${Date.now()}${ext}`);
   fs.writeFileSync(tmp, text.endsWith('\n') ? text : `${text}\n`, { mode: 0o600 });
   const q = `'${tmp.replace(/'/g, `'\\''`)}'`;
-  return `${bin} ${q}; rm -f ${q}`;
+  return { line: `cat ${q}; ${bin} ${q}`, tmpPath: tmp, bin };
 }

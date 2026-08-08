@@ -69,45 +69,85 @@ a27f934 fix gex: engineered prompts + reject hollow Done
 
 ---
 
-## What is broken / WIP right now
+## STATE AS OF 2026-08-07 EVENING — READ THIS FIRST
 
-### P0 — Multiline / script execution reliability
-**Symptom:** Model tries `osascript -e '…'` (wrong AirPlay syntax) then retries near-identical commands; when it tries heredocs, fish bind / single-line paste collapses them (`osascript <<'EOF'tell…` one line) and `__gex_bind_execute` errors.
+### ⛔ P0 BLOCKER — rejection loop in gate() (I introduced this)
+**Symptom:** runs die with `Stopped: 10 malformed/blocked turns in a row
+without productive work`. Reproduced by TWO independent mock tests.
+Debug output shows `REJECT.needEfficiency` firing repeatedly even though
+call 1 supplied a valid efficiency card, i.e. `efficiencyLocked` reads
+false when it should be true.
 
-**Cause (general, not Music-specific):**
-1. Fish interactive Enter bind was intercepting *all* Enter — **fixed in tree** (`GEX_AUTOPILOT` skip + only single-line `gex`). Needs install + verify.
-2. Models emit single-line `-e` chains or broken one-line heredocs.
-3. Host now supports: real newlines in `command`, `\\n` expansion, and `script` body → temp file. **Needs end-to-end verify in real Ghostty.**
+**Where to look:** `gate()` in `src/agent.js`, specifically the `done`
+branch. Both failing tests exercise `done`. The most recent edits there
+are the hedge/`unverifiedPremise` check and the hoisted
+`verificationEarly` const — revert just that block to confirm.
 
-**Verify:**
-```fish
-cd ~/Documents/gshell && git pull && npm run postinstall
-# In Ghostty (real TTY):
-gex -- "play end of summer by tame impala on apple music to bedroom or homepod"
-# Should NOT spam the same failing osascript; should use script/heredoc/file and change approach.
-# While running, type on steer›: stuck
-```
+**Repro:** mock `fetch`; call 1 → `{action:'submit', efficiency:{…},
+command:'echo hi'}`; call 2 → `{action:'done', message:'…'}`. Log `kind`,
+`efficiencyLocked`, and the returned reject string each turn.
 
-### P0 — Steer usability under Gengar bar
-Steer line paints row `rows-1`; Ghostty sometimes injects `P>|ghostty…` — filter added. Confirm typing still works during long `thinking` (model call) and `watching`.
+**Until this is fixed, do not trust any agent-loop test result.**
+
+### ✅ Verified working (tested against a real PTY / live backends)
+- **fish, not zsh.** `resolveShell()` preferred stale `$SHELL`. Fixed.
+- **Anti-loop for scripts.** `materializeScript` chained `; rm -f`, so exit
+  status reflected `rm`, never the script → failures never recorded → 13x
+  retries. Temp files now deleted from Node.
+- **Batch loop detection.** parallel/discover had none. Blocks on
+  REPETITION, not failure — "produced output" != "made progress" (a batch
+  with one always-succeeds job looked productive forever). 2 strikes.
+- **Visible parallel jobs.** Real fish job control (`begin;…;end &` + `wait`).
+- **Temp scripts `cat`'d before running** — source never hidden.
+- **Delta-only context.** Was feeding back the whole 16k scrollback every
+  turn, so the strongest pattern in context was its own failed commands.
+- **Task routing.** World-knowledge questions go to gsearch instead of
+  grepping the machine. CONFIRMED IN A LIVE RUN: 7s vs 3min of ioreg.
+- **GSearch retrieval.** Context7 ranking fixed (was returning
+  `devices.css` for AppleScript queries); corroboration counts DISTINCT
+  ORIGINS (3 topic-slices of one library are one source, not three);
+  `Set.length` bug made corroboration silently always-empty; relevance
+  guard returns "NO RELEVANT LIBRARY" instead of nonsense.
+  Verified: zod/react/fastapi correct, nonsense → 0 confirmed.
+- **Firecrawl `/v1/search`** is the tier that answers OS/scripting/idiom
+  questions. Verified returning the right StackOverflow answer.
+
+### ⚠️ Written but UNVERIFIED (blocked by the P0 above)
+- Fabricated-premise gate (hedge words → demand evidence)
+- Steer acknowledgment banner + faster repaint
+- Two-round gsearch (round 1 vocabulary → refined round 2)
+
+### 🔴 Known-bad behaviour still in the wild
+**gex fabricates premises and dresses them in real output.** Live run:
+never verified where the panel was made, filled the gap with "most likely
+China", then ran a genuine `TZ=Asia/Shanghai date`. Output authentic,
+answer invented. Ignored an explicit "use gsearch as proof".
+This is the most dangerous failure mode here — the others *looked* broken.
+
+**Steer is unreliable** — `watchUntilPrompt` returns early on steer while
+the command keeps running (PTY race), and keystrokes were dropped during
+heavy scrolling output.
+
+### Infra (all live, installer handles from scratch)
+`node scripts/gsearch-setup.js` (diagnose) / `--install` / `--down`
+Five install blockers found and automated: Apple `container` has no
+compose → colima fallback; compose v2 plugin dir unregistered
+(`~/.docker/config.json`); `buildx` missing → docker SILENTLY used the
+legacy builder and failed 20 steps deep; BuildKit env; colima sized from
+host CPUs (api service reserves >2).
+
+### Uncommitted
+`?? src/mind/gsearch.js` and `?? scripts/gsearch-setup.js` are UNTRACKED.
+`M TODO.md src/agent.js src/prompts.js src/pty_session.js`.
+Suggest committing the verified pieces (gsearch module, setup script,
+prompts) SEPARATELY from `agent.js`, which carries the P0 bug.
 
 ### P1 — agent.js edit fragility
-Repeated mid-file surgical edits corrupted `agent.js` (orphan braces, half helpers). Prefer **full-function rewrites** or small python/ast patches. Always `node --check src/agent.js` before commit.
-
-### P1 — Model quality / loop intelligence
-DeepSeek often:
-- locks onto one broken command shape
-- invents wrong AppleScript class names (`airplay devices` vs `AirPlay device`)
-- says Done too early (partially gated)
-- underuses `script` field and survey
-
-**Not solved by hardcoding Music.** Solved by better prompts, better TOOL_RESULT coaching, fail-map (done), maybe tool docs in survey (“osascript exists”), and stronger model.
-
-### P2 — Playbook poisoning
-Seeded efficiency/playbooks can bias wrong. Match is tag-based; bad wins get recorded. Need quality bar on `recordWin` and playbook match confidence.
-
-### P2 — Exit codes
-`inferExit` heuristics help; still no true child exit from the interactive fish line in all cases. Consider `echo GEX_EXIT:$status` wrapper for submitted commands (generic).
+Repeated mid-file surgical edits corrupted `agent.js` before. Prefer
+**full-function rewrites**, and always `node --check src/agent.js` (and
+`src/pty_session.js`) before commit — every fix above was also verified
+live against a real PTY (see git history / ask for the smoke-test pattern),
+not just syntax-checked.
 
 ---
 

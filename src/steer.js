@@ -32,7 +32,7 @@ export class SteerInput {
     // binary so we can parse escapes cleanly
     process.stdin.setEncoding(null);
     process.stdin.on('data', this._onData);
-    this._repaint = setInterval(() => this._paint(), 350);
+    this._repaint = setInterval(() => this._paint(), 120);
     this._repaint.unref?.();
     this._paint();
   }
@@ -129,6 +129,7 @@ export class SteerInput {
       // printable ASCII + common unicode (latin1 high bytes decoded later as utf8-ish)
       if (ch >= ' ' && ch !== '\x7f') {
         this.buf += ch;
+        this._dirty = true;
         if (this.buf.length > 500) this.buf = this.buf.slice(0, 500);
         // auto-drop protocol junk if it snuck in
         if (/P>\|ghostty|^\s*P>\|/.test(this.buf)) {
